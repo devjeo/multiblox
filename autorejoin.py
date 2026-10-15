@@ -1,0 +1,528 @@
+"""
+Phase 4: auto-rejoin.
+
+Watches every account launched through launcher.py and, if auto-rejoin is ON
+for that account, relaunches it when it disconnects.
+
+A disconnect is detected three ways:
+  1. PROCESS EXIT   - the client's RobloxPlayerBeta.exe is gone (instant).
+  2. LOG MARKERS    - the client's log under %LOCALAPPDATA%\\Roblox\\logs contains a
+                      disconnect marker. To avoid killing a healthy client (e.g.
+                      during a teleport), a marker is only acted on if Roblox
+                      presence shows the account is NOT in a game ~15s later.
+  3. PRESENCE       - Roblox presence says the account is not in a game for two
+                      checks in a row (about 90s), covering clients that are
+                      still open on an error screen.
+
+Safety limits: no action in the first 30s after a client starts, at most 5
+rejoin attempts per account per 10 minutes, and the first attempt returns to
+the same server (job) while later attempts accept any server.
+
+NOTE: closing a client yourself looks like a disconnect. Use the launcher's
+'stop' command (or turn auto-rejoin off) when you want a client to stay closed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobloxAccountManager/0.5"
+
+# Lowercase substrings that suggest the client lost its connection.
+# Tune these using rejoin_debug.log (see _dump_debug) if they misfire on your PC.
+DISCONNECT_MARKERS = (
+    "connection lost",
+    "time to disconnect replication data",
+    "disconnected",
+)
+
+GRACE_SECONDS = 30            # ignore disconnect signals right after a client starts
+MARKER_DEBOUNCE_SECONDS = 15  # wait this long after a log marker, then check presence
+PRESENCE_POLL_SECONDS = 45
+PRESENCE_MISS_LIMIT = 2       # consecutive "not in game" polls before rejoining
+REJOIN_COOLDOWN_SECONDS = 8
+SETTLE_SECONDS = 6            # pause after a launch so the event-handle closer can finish
+MAX_ATTEMPTS = 5
+ATTEMPT_WINDOW_SECONDS = 600
+RETRY_DELAY_SECONDS = 30
+NEW_CLIENT_TIMEOUT = 90
+LOG_MAP_TIMEOUT = 180
+
+DEBUG_LOG = Path(__file__).with_name("rejoin_debug.log")
+PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in game", 3: "in Studio"}
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def fetch_own_presence(cookie: str, user_id: int) -> dict | None:
+    """Presence of the account that owns `cookie`. None means 'could not tell'."""
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "Content-Type": "application/json",
+        "Referer": "https://www.roblox.com/",
+        "User-Agent": USER_AGENT,
+    }
+    body = json.dumps({"userIds": [user_id]}).encode("utf-8")
+    csrf = None
+    for _ in range(2):
+        if csrf:
+            headers["X-CSRF-TOKEN"] = csrf
+        req = urllib.request.Request(PRESENCE_URL, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                presences = json.loads(resp.read().decode("utf-8")).get("userPresences") or []
+                return presences[0] if presences else None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403 and exc.headers.get("x-csrf-token") and not csrf:
+                csrf = exc.headers["x-csrf-token"]
+                continue
+            return None
+        except Exception:
+            return None
+    return None
+
+
+def process_creation_utc(pid: int) -> datetime | None:
+    """When the process started (UTC). Windows only."""
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    fp = ctypes.POINTER(wintypes.FILETIME)
+    k.GetProcessTimes.argtypes = [wintypes.HANDLE, fp, fp, fp, fp]
+    k.GetProcessTimes.restype = wintypes.BOOL
+    handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        c, e, kt, ut = (wintypes.FILETIME() for _ in range(4))
+        if not k.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e), ctypes.byref(kt), ctypes.byref(ut)):
+            return None
+        ticks = (c.dwHighDateTime << 32) | c.dwLowDateTime
+        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
+    finally:
+        k.CloseHandle(handle)
+
+
+_LOG_TS_RE = re.compile(r"_(\d{8}T\d{6})Z_")
+
+
+def find_log_for_process(log_dir: Path, created_utc: datetime, claimed: set) -> Path | None:
+    """Roblox names each client log ..._<UTC timestamp>Z_Player_..._last.log; pick the
+    one created closest to when this process started."""
+    best, best_delta = None, None
+    try:
+        candidates = list(log_dir.glob("*Player*.log"))
+    except OSError:
+        return None
+    for p in candidates:
+        if p in claimed:
+            continue
+        m = _LOG_TS_RE.search(p.name)
+        try:
+            if m:
+                ts = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+            else:
+                ts = datetime.fromtimestamp(p.stat().st_ctime, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        delta = (ts - created_utc).total_seconds()
+        if -5 <= delta <= 60 and (best is None or abs(delta) < best_delta):
+            best, best_delta = p, abs(delta)
+    return best
+
+
+def read_new_lines(path: Path, offset: int) -> tuple[list[str], int]:
+    """Returns complete lines written since `offset`, and the new offset."""
+    try:
+        size = path.stat().st_size
+        if size < offset:
+            offset = 0
+        if size == offset:
+            return [], offset
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return [], offset
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return [], offset
+    chunk = data[: last_nl + 1]
+    return chunk.decode("utf-8", "replace").splitlines(), offset + len(chunk)
+
+
+# --------------------------------------------------------------------------
+# Manager
+# --------------------------------------------------------------------------
+@dataclass
+class Client:
+    account: object
+    place_id: int
+    job_id: str | None
+    pid: int | None = None
+    state: str = "starting"  # starting | running | rejoining | waiting_retry | gave_up | closed
+    started: float = 0.0
+    log_path: Path | None = None
+    log_offset: int = 0
+    log_lines: deque = field(default_factory=lambda: deque(maxlen=15))
+    marker_at: float | None = None
+    marker_name: str = ""
+    misses: int = 0
+    last_presence: float = 0.0
+    retry_at: float = 0.0
+    attempts: deque = field(default_factory=deque)
+    cancelled: bool = False   # set by stop_account / a newer launch: abandon any rejoin in progress
+    created_utc: datetime | None = None  # process start time, used to re-attach after an app restart
+
+
+class RejoinManager(threading.Thread):
+    def __init__(self, store, launch_fn, list_pids_fn, kill_fn, log_fn=print,
+                 log_dir: Path | None = None, creation_fn=process_creation_utc, presence_fn=None,
+                 clock=time.monotonic, sleep=time.sleep, spawn=None):
+        super().__init__(daemon=True)
+        self.store = store
+        self.launch_fn = launch_fn      # (account, place_id, job_id) -> None, raises on failure
+        self.list_pids = list_pids_fn   # () -> set[int] of running game-client PIDs
+        self.kill_fn = kill_fn          # (pid) -> None
+        self.log = log_fn
+        self.log_dir = log_dir or Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "logs"
+        self.creation_fn = creation_fn
+        self.presence_fn = presence_fn or self._presence
+        self.clock, self.sleep = clock, sleep
+        self._spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start())
+        self.clients: dict[str, Client] = {}
+        self._lock = threading.RLock()
+        self._launch_lock = threading.Lock()
+        self._stop_event = threading.Event()
+
+    # ---- public API ----------------------------------------------------
+    def launch(self, account, place_id: int, job_id: str | None = None) -> Client:
+        """Launch an account, wait until its client appears, and start tracking it.
+        Raises whatever launch_fn raises (LaunchError)."""
+        with self._launch_lock:
+            client = Client(account, place_id, job_id)
+            before = set(self.list_pids())
+            self.launch_fn(account, place_id, job_id)
+            with self._lock:
+                old = self.clients.get(account.id)
+                if old is not None:
+                    old.cancelled = True  # a stale tracker must not keep rejoining in parallel
+                self.clients[account.id] = client
+            self._await_pid(client, before)
+            self.sleep(SETTLE_SECONDS)
+        return client
+
+    def set_enabled(self, account, enabled: bool) -> None:
+        account.autoRejoinEnabled = enabled
+        self.store.save()
+
+    def stop_account(self, account) -> bool:
+        """Close an account's client on purpose (no auto-rejoin)."""
+        with self._lock:
+            client = self.clients.pop(account.id, None)
+        if client:
+            client.cancelled = True  # a rejoin already in progress checks this and backs out
+        if client and client.pid and client.pid in set(self.list_pids()):
+            self.kill_fn(client.pid)
+            self.log(f"[rejoin] {account.username}: stopped on request (PID {client.pid})")
+            return True
+        return False
+
+    def resume(self, account) -> bool:
+        """Clear a 'gave up' state and try again now."""
+        with self._lock:
+            client = self.clients.get(account.id)
+        if not client or client.state not in ("gave_up", "closed", "waiting_retry"):
+            return False
+        client.attempts.clear()
+        client.state = "rejoining"
+        self._spawn(self._rejoin, client)
+        return True
+
+    # ---- restart recovery (see sessions.py) -----------------------------
+    def session_records(self) -> list[dict]:
+        """What should survive an app restart: one JSON-safe dict per tracked client."""
+        out = []
+        with self._lock:
+            for c in self.clients.values():
+                if c.cancelled or c.state not in ("running", "starting", "rejoining", "waiting_retry"):
+                    continue
+                out.append({
+                    "accountId": c.account.id, "placeId": c.place_id, "jobId": c.job_id, "pid": c.pid,
+                    "createdUtc": c.created_utc.isoformat() if c.created_utc else None,
+                })
+        return out
+
+    def adopt(self, account, place_id: int, job_id: str | None, pid: int | None,
+              created_iso: str | None) -> bool:
+        """Re-attach to a client that outlived an app restart. Refuses if the PID is gone or
+        now belongs to a different process (recycled PID: creation times differ)."""
+        if not pid or pid not in set(self.list_pids()):
+            return False
+        saved = None
+        if created_iso:
+            try:
+                saved = datetime.fromisoformat(created_iso)
+            except ValueError:
+                saved = None
+        try:
+            actual = self.creation_fn(pid)
+        except Exception:
+            actual = None
+        if saved and actual and abs((actual - saved).total_seconds()) > 2:
+            return False
+        with self._lock:
+            if any(x.pid == pid for x in self.clients.values()):
+                return False
+            c = Client(account, place_id, job_id)
+            c.pid, c.state = pid, "running"
+            age = (datetime.now(timezone.utc) - actual).total_seconds() if actual else 0.0
+            c.started = self.clock() - max(age, 0.0)
+            c.created_utc = actual or saved
+            c.last_presence = self.clock()
+            self.clients[account.id] = c
+        return True
+
+    def recover(self, account, place_id: int, job_id: str | None) -> None:
+        """Relaunch an account whose client died while the app was not running."""
+        c = Client(account, place_id, job_id, state="rejoining")
+        with self._lock:
+            self.clients[account.id] = c
+        self._spawn(self._rejoin, c)
+
+    def status_lines(self) -> list[str]:
+        now = self.clock()
+        lines = []
+        with self._lock:
+            for c in self.clients.values():
+                up = f"{now - c.started:.0f}s" if c.started else "-"
+                on = "ON" if c.account.autoRejoinEnabled else "off"
+                lines.append(f"  {c.account.username}: PID {c.pid or '-'} | {c.state} | up {up} | "
+                             f"auto-rejoin {on} | attempts {len(c.attempts)}/{MAX_ATTEMPTS}")
+        return lines
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    # ---- thread loop ----------------------------------------------------
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as exc:  # keep the watcher alive no matter what
+                self.log(f"[rejoin] internal error: {exc!r}")
+            self._stop_event.wait(1.0)
+
+    def _tick(self) -> None:
+        now = self.clock()
+        alive = set(self.list_pids())
+        with self._lock:
+            clients = list(self.clients.values())
+        for c in clients:
+            try:  # one account's problem must never stop the others from being watched
+                if c.cancelled:
+                    continue
+                if c.state == "running":
+                    self._check_running(c, now, alive)
+                elif c.state == "waiting_retry" and now >= c.retry_at:
+                    c.state = "rejoining"
+                    self._spawn(self._rejoin, c)
+            except Exception as exc:
+                self.log(f"[rejoin] {c.account.username}: internal error: {exc!r}")
+
+    # ---- detection ------------------------------------------------------
+    def _check_running(self, c: Client, now: float, alive: set) -> None:
+        if c.pid not in alive:
+            self._on_disconnect(c, "client process exited")
+            return
+        uptime = now - c.started
+        self._poll_log(c, now, uptime)
+
+        if c.marker_at is not None and now - c.marker_at >= MARKER_DEBOUNCE_SECONDS:
+            marker, c.marker_at = c.marker_name, None
+            p = self.presence_fn(c.account)
+            ptype = p.get("userPresenceType") if p else None
+            if ptype is None:
+                self.log(f"[rejoin] {c.account.username}: log marker '{marker}' but presence unavailable; ignoring")
+            elif ptype != 2:
+                self._on_disconnect(c, f"log marker '{marker}' and presence is {PRESENCE_NAMES.get(ptype, ptype)}")
+                return
+            else:
+                self.log(f"[rejoin] {c.account.username}: log marker '{marker}' but still in game; ignoring")
+
+        if now - c.last_presence >= PRESENCE_POLL_SECONDS:
+            c.last_presence = now
+            self._poll_presence(c, uptime)
+
+    def _poll_presence(self, c: Client, uptime: float) -> None:
+        p = self.presence_fn(c.account)
+        if p is None:
+            return  # couldn't tell - never count that as a miss
+        if p.get("userPresenceType") == 2:
+            c.misses = 0
+            place, job = p.get("placeId") or p.get("rootPlaceId"), p.get("gameId")
+            changed = False
+            if place and int(place) != c.place_id:
+                c.place_id, changed = int(place), True
+            if job and job != c.job_id:
+                c.job_id, changed = job, True
+            acct = c.account
+            if changed or acct.savedPlaceId != c.place_id or acct.savedJobId != c.job_id:
+                acct.savedPlaceId, acct.savedJobId = c.place_id, c.job_id
+                if p.get("lastLocation"):
+                    acct.lastGameName = p["lastLocation"]
+                self.store.save()
+        elif uptime >= GRACE_SECONDS:
+            c.misses += 1
+            if c.misses >= PRESENCE_MISS_LIMIT:
+                ptype = p.get("userPresenceType")
+                self._on_disconnect(c, f"presence says {PRESENCE_NAMES.get(ptype, ptype)}")
+
+    def _poll_log(self, c: Client, now: float, uptime: float) -> None:
+        if c.log_path is None:
+            if uptime > LOG_MAP_TIMEOUT:
+                return
+            created = self.creation_fn(c.pid)
+            if not created:
+                return
+            with self._lock:
+                claimed = {x.log_path for x in self.clients.values() if x.log_path and x is not c}
+            path = find_log_for_process(self.log_dir, created, claimed)
+            if path:
+                c.log_path = path
+                try:
+                    c.log_offset = path.stat().st_size  # only watch what happens from now on
+                except OSError:
+                    c.log_offset = 0
+                self.log(f"[rejoin] {c.account.username}: watching {path.name}")
+            return
+        lines, c.log_offset = read_new_lines(c.log_path, c.log_offset)
+        for line in lines:
+            c.log_lines.append(line)
+            low = line.lower()
+            if c.marker_at is None and uptime >= GRACE_SECONDS:
+                for marker in DISCONNECT_MARKERS:
+                    if marker in low:
+                        c.marker_at, c.marker_name = now, marker
+                        self._dump_debug(c, marker)
+                        break
+
+    def _dump_debug(self, c: Client, marker: str) -> None:
+        """Save the log lines around a marker (long tokens redacted) so markers can be tuned."""
+        try:
+            with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {c.account.username} "
+                        f"marker '{marker}' ===\n")
+                for line in c.log_lines:
+                    f.write(re.sub(r"[A-Za-z0-9_.\-]{50,}", "<redacted>", line) + "\n")
+        except OSError:
+            pass
+
+    # ---- reacting -------------------------------------------------------
+    def _on_disconnect(self, c: Client, reason: str) -> None:
+        self.log(f"[rejoin] {c.account.username}: disconnect detected - {reason}")
+        if not c.account.autoRejoinEnabled:
+            c.state = "closed"
+            self.log(f"[rejoin] {c.account.username}: auto-rejoin is OFF for this account; leaving it closed")
+            return
+        c.state = "rejoining"
+        self._spawn(self._rejoin, c)
+
+    def _rejoin(self, c: Client) -> None:
+        with self._launch_lock:
+            if c.cancelled or self._stop_event.is_set():
+                return
+            now = self.clock()
+            while c.attempts and now - c.attempts[0] > ATTEMPT_WINDOW_SECONDS:
+                c.attempts.popleft()
+            if len(c.attempts) >= MAX_ATTEMPTS:
+                c.state = "gave_up"
+                self.log(f"[rejoin] {c.account.username}: gave up after {MAX_ATTEMPTS} attempts in "
+                         f"{ATTEMPT_WINDOW_SECONDS // 60} min. Use 'resume' to try again.")
+                return
+            c.attempts.append(now)
+            n = len(c.attempts)
+
+            if c.pid and c.pid in set(self.list_pids()):
+                self.kill_fn(c.pid)
+                for _ in range(20):
+                    if c.pid not in set(self.list_pids()):
+                        break
+                    self.sleep(0.5)
+
+            self.sleep(REJOIN_COOLDOWN_SECONDS)
+            if c.cancelled or self._stop_event.is_set():  # Stop / quit pressed during the cooldown
+                self.log(f"[rejoin] {c.account.username}: rejoin cancelled")
+                return
+            job = c.job_id if n == 1 else None  # first try: same server; later: any server
+            before = set(self.list_pids())
+            try:
+                self.launch_fn(c.account, c.place_id, job)
+            except Exception as exc:
+                self.log(f"[rejoin] {c.account.username}: relaunch failed - {exc}")
+                if getattr(exc, "fatal", False):
+                    c.state = "gave_up"
+                    self.log(f"[rejoin] {c.account.username}: giving up (this will not fix itself)")
+                else:
+                    c.state, c.retry_at = "waiting_retry", self.clock() + RETRY_DELAY_SECONDS
+                return
+            c.job_id = job
+            self.log(f"[rejoin] {c.account.username}: relaunched (attempt {n}/{MAX_ATTEMPTS}, "
+                     f"{'same server' if job else 'any server'})")
+            self._await_pid(c, before)
+            self.sleep(SETTLE_SECONDS)
+
+    def _await_pid(self, c: Client, before: set) -> None:
+        deadline = self.clock() + NEW_CLIENT_TIMEOUT
+        while self.clock() < deadline and not self._stop_event.is_set():
+            with self._lock:
+                claimed = {x.pid for x in self.clients.values() if x.pid and x is not c}
+            new = sorted(set(self.list_pids()) - before - claimed)
+            if new:
+                if c.cancelled:  # Stop was pressed while this client was starting
+                    self.kill_fn(new[0])
+                    self.log(f"[rejoin] {c.account.username}: stopped while starting; closed PID {new[0]}")
+                    return
+                with self._lock:
+                    c.pid, c.state, c.started = new[0], "running", self.clock()
+                    c.log_path, c.log_offset = None, 0
+                    c.marker_at, c.misses, c.last_presence = None, 0, self.clock()
+                try:
+                    c.created_utc = self.creation_fn(c.pid)
+                except Exception:
+                    c.created_utc = None
+                self.log(f"[rejoin] {c.account.username}: tracking client PID {c.pid}")
+                return
+            self.sleep(0.5)
+        self.log(f"[rejoin] {c.account.username}: no new Roblox client appeared after launching")
+        if c.account.autoRejoinEnabled:
+            c.state, c.retry_at = "waiting_retry", self.clock() + RETRY_DELAY_SECONDS
+        else:
+            c.state = "closed"
+
+    # ---- default presence lookup ---------------------------------------
+    def _presence(self, account) -> dict | None:
+        try:
+            cookie = self.store.get_cookie(account)
+        except OSError:
+            return None
+        try:
+            return fetch_own_presence(cookie, account.userId)
+        finally:
+            del cookie

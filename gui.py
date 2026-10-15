@@ -1,0 +1,907 @@
+"""
+Phase 5: desktop window for the Roblox Account Manager (Windows only).
+
+One window for everything the console tools do:
+  - Account list with live status (running / rejoining / gave up ...), uptime,
+    last game and a per-account auto-rejoin switch. Select several rows to act
+    on them together (Ctrl/Shift-click, Ctrl+A for all).
+  - Multi-instance ON/OFF switch (holds the mutex + closes the event handle).
+  - Game picker (saved places from places.py) + optional server (job) ID.
+  - Launch Selected / Join All / Stop / Resume / Auto-rejoin toggles.
+  - Settings (rejoin cooldown, retry limits, polling), saved to settings.json.
+  - Live log panel (everything multi_instance / autorejoin print shows up here).
+  - Optional system tray (needs:  pip install pystray pillow). Without it the
+    window simply closes/quits normally.
+  - Restart recovery: clients that survive an app restart are re-attached, and
+    after a crash accounts with auto-rejoin ON are relaunched (see sessions.py).
+  - Diagnostics window (diagnostics.py): checks Roblox, the network, cookies and
+    multi-instance, with a redacted report you can copy.
+
+Run (as administrator, for the event-handle step):
+    python gui.py
+
+Keep this file in the same folder as account_store.py, multi_instance.py,
+autorejoin.py, launcher.py and places.py. Do NOT run launcher.py or
+multi_instance.py at the same time. Standard library only (tkinter).
+"""
+
+from __future__ import annotations
+
+import ctypes
+import io
+import json
+import os
+import queue
+import sys
+import threading
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
+from tkinter.scrolledtext import ScrolledText
+
+if sys.platform != "win32":
+    sys.exit("This tool only works on Windows.")
+
+import autorejoin
+import diagnostics
+import multi_instance
+from account_store import DATA_DIR, AccountStore, CookieError
+from autorejoin import RejoinManager
+from launcher import LaunchError, _running_pids, kill_pid, launch_account
+from multi_instance import (
+    ProcessWatcher,
+    SingletonHolder,
+    find_roblox_processes,
+    log as mi_log,
+    make_event_closer,
+)
+from places import PlaceStore, fetch_place_name, parse_place_input
+from sessions import SessionStore, restore as restore_sessions
+
+APP_TITLE = "Roblox Account Manager"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+PERF_WARN_CLIENTS = 5   # warn before this many clients run at once
+LOG_MAX_LINES = 1000
+
+DEFAULTS = {
+    "autoEnableMultiInstance": True,
+    "closeToTray": True,
+    "rejoinCooldown": 8,         # autorejoin.REJOIN_COOLDOWN_SECONDS
+    "maxAttempts": 5,            # autorejoin.MAX_ATTEMPTS
+    "attemptWindowMinutes": 10,  # autorejoin.ATTEMPT_WINDOW_SECONDS / 60
+    "presencePollSeconds": 45,   # autorejoin.PRESENCE_POLL_SECONDS
+    "launchPauseSeconds": 6,     # autorejoin.SETTLE_SECONDS (pause after each launch)
+    "restoreSessions": True,     # re-attach to surviving clients on startup
+    "rejoinAfterCrash": True,    # relaunch dead ones after an unclean exit (auto-rejoin accounts only)
+    "mutexNames": "ROBLOX_singletonMutex",  # comma separated; change if a Roblox update renames them
+    "eventNames": "ROBLOX_singletonEvent",
+}
+
+STATE_LABELS = {
+    "starting": ("Starting...", "busy"),
+    "running": ("Running", "ok"),
+    "rejoining": ("Rejoining...", "busy"),
+    "waiting_retry": ("Retrying soon", "busy"),
+    "gave_up": ("Gave up - use Resume", "bad"),
+    "closed": ("Closed", "idle"),
+}
+
+
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+class Settings(dict):
+    def __init__(self) -> None:
+        super().__init__(DEFAULTS)
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for key, default in DEFAULTS.items():
+                if key in raw and type(raw[key]) is type(default):
+                    self[key] = raw[key]
+        except (OSError, ValueError):
+            pass
+        self.apply()
+
+    def save(self) -> None:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(self), f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+
+    def apply(self) -> None:
+        """Push the tunables into autorejoin (it reads these module globals live)."""
+        autorejoin.REJOIN_COOLDOWN_SECONDS = self["rejoinCooldown"]
+        autorejoin.MAX_ATTEMPTS = self["maxAttempts"]
+        autorejoin.ATTEMPT_WINDOW_SECONDS = self["attemptWindowMinutes"] * 60
+        autorejoin.PRESENCE_POLL_SECONDS = self["presencePollSeconds"]
+        autorejoin.SETTLE_SECONDS = self["launchPauseSeconds"]
+        split = lambda text: [n.strip() for n in text.split(",") if n.strip()]
+        multi_instance.set_singleton_names(split(self["mutexNames"]), split(self["eventNames"]))
+
+
+# --------------------------------------------------------------------------
+# stdout/stderr -> log panel (also keeps working under pythonw, where they are None)
+# --------------------------------------------------------------------------
+class _LogStream(io.TextIOBase):
+    def __init__(self, q: queue.Queue, original=None) -> None:
+        self.q, self.original = q, original
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        if self.original:
+            try:
+                self.original.write(s)
+            except Exception:
+                pass
+        with self._lock:
+            self._buf += s
+            *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            if line.strip():
+                self.q.put(line.rstrip())
+        return len(s)
+
+    def flush(self) -> None:
+        if self.original:
+            try:
+                self.original.flush()
+            except Exception:
+                pass
+
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _fix_tk_tag_colors(style: ttk.Style) -> None:
+    """Tk 8.6.9 ignores Treeview row tag colours unless this is applied."""
+    def fixed(option):
+        return [e for e in style.map("Treeview", query_opt=option) if e[:2] != ("!disabled", "!selected")]
+    style.map("Treeview", foreground=fixed("foreground"), background=fixed("background"))
+
+
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
+class App:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.ui_q: queue.Queue = queue.Queue()   # callables to run on the Tk thread
+        self.log_q: queue.Queue = queue.Queue()  # log lines
+        sys.stdout = _LogStream(self.log_q, sys.stdout)
+        sys.stderr = _LogStream(self.log_q, sys.stderr)
+
+        threading.excepthook = lambda a: mi_log(
+            f"[!] Background error in {getattr(a.thread, 'name', '?')}: {a.exc_value!r}")
+        self.settings = Settings()
+        self.store = AccountStore()
+        self.places = PlaceStore()
+        self.launching: dict[str, str] = {}  # account id -> "Queued..." / "Launching..."
+        self.tray = None
+        self._closing = False
+
+        # ---- backend (same wiring as launcher.main)
+        self.holder = SingletonHolder()
+        self.watcher = ProcessWatcher(
+            holder_state=self.holder.describe, on_game_start=make_event_closer(self.holder))
+        self.watcher.start()
+        self.manager = RejoinManager(
+            store=self.store,
+            launch_fn=lambda account, place_id, job_id: launch_account(self.store, account, place_id, job_id),
+            list_pids_fn=_running_pids,
+            kill_fn=kill_pid,
+            log_fn=mi_log,
+        )
+        self.manager.start()
+
+        # Crash/restart recovery. Records are loaded now, restored after multi-instance is on
+        # (see startup). Nothing is written to sessions.json until that has happened.
+        self.sessions = SessionStore()
+        self._boot_records, self._boot_clean = (
+            self.sessions.load() if self.settings["restoreSessions"] else ([], True))
+        self._restored = False
+
+        self._build_ui()
+        self._setup_tray()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.report_callback_exception = lambda *exc: mi_log(f"[!] UI error: {exc[1]!r}")
+
+        self.drain()
+        self.refresh()
+        root.after(300, self.startup)
+
+    # ---- helpers --------------------------------------------------------
+    def ui(self, fn) -> None:
+        """Run `fn` on the Tk thread (safe to call from any thread)."""
+        self.ui_q.put(fn)
+
+    def run_bg(self, fn, *args) -> None:
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
+    def set_status(self, text: str) -> None:
+        self.ui(lambda: self.status_var.set(text))
+
+    def client_snapshot(self) -> dict:
+        with self.manager._lock:
+            return {aid: (c.state, c.pid, c.started, len(c.attempts))
+                    for aid, c in self.manager.clients.items()}
+
+    def selected_accounts(self) -> list:
+        chosen = set(self.tree.selection())
+        return [a for a in self.store.accounts if a.id in chosen]
+
+    # ---- UI construction ------------------------------------------------
+    def _build_ui(self) -> None:
+        root = self.root
+        root.title(APP_TITLE)
+        root.geometry("980x640")
+        root.minsize(820, 520)
+
+        style = ttk.Style()
+        _fix_tk_tag_colors(style)
+        style.configure("On.TButton", foreground="#0a7d2c")
+        style.configure("Off.TButton", foreground="#b00020")
+        style.configure("Treeview", rowheight=26)
+
+        # top bar
+        top = ttk.Frame(root, padding=(10, 8))
+        top.pack(fill="x")
+        self.mi_btn = ttk.Button(top, width=22, command=self.toggle_multi)
+        self.mi_btn.pack(side="left")
+        self.ar_btn = ttk.Button(top, width=20, command=self.toggle_all_rejoin)
+        self.ar_btn.pack(side="left", padx=6)
+        ttk.Button(top, text="Settings...", command=self.open_settings).pack(side="right")
+        ttk.Button(top, text="Diagnostics...", command=self.open_diagnostics).pack(side="right", padx=6)
+        if not _is_admin():
+            ttk.Label(top, foreground="#b36b00",
+                      text="Not running as administrator - closing the singleton event may fail."
+                      ).pack(side="right", padx=10)
+
+        body = ttk.Frame(root, padding=(10, 0))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        # accounts (left)
+        left = ttk.LabelFrame(body, text="Accounts", padding=6)
+        left.grid(row=0, column=0, sticky="nsew")
+        cols = ("status", "game", "rejoin", "uptime")
+        self.tree = ttk.Treeview(left, columns=cols, selectmode="extended", show="tree headings")
+        self.tree.heading("#0", text="Account")
+        self.tree.heading("status", text="Status")
+        self.tree.heading("game", text="Last game")
+        self.tree.heading("rejoin", text="Auto-rejoin")
+        self.tree.heading("uptime", text="Uptime")
+        self.tree.column("#0", width=150)
+        self.tree.column("status", width=150)
+        self.tree.column("game", width=200)
+        self.tree.column("rejoin", width=80, anchor="center")
+        self.tree.column("uptime", width=70, anchor="e")
+        for tag, color in (("ok", "#0a7d2c"), ("busy", "#b36b00"), ("bad", "#b00020"), ("idle", "#777777")):
+            self.tree.tag_configure(tag, foreground=color)
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<Button-3>", self.on_right_click)
+        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
+
+        self.menu = tk.Menu(root, tearoff=0)
+        self.menu.add_command(label="Launch", command=lambda: self.launch_accounts(self.selected_accounts()))
+        self.menu.add_command(label="Stop", command=self.stop_selected)
+        self.menu.add_command(label="Resume", command=self.resume_selected)
+        self.menu.add_command(label="Toggle auto-rejoin", command=self.toggle_selected_rejoin)
+        self.menu.add_separator()
+        self.menu.add_command(label="Remove account", command=self.remove_selected)
+
+        # controls (right)
+        right = ttk.Frame(body, padding=(10, 0, 0, 0))
+        right.grid(row=0, column=1, sticky="ns")
+
+        game = ttk.LabelFrame(right, text="Game", padding=8)
+        game.pack(fill="x")
+        self.place_var = tk.StringVar()
+        self.place_cb = ttk.Combobox(game, textvariable=self.place_var, width=30)
+        self.place_cb.pack(fill="x")
+        ttk.Label(game, text="Pick a saved game, or paste a place ID / link.",
+                  foreground="#777777", wraplength=240).pack(anchor="w", pady=(2, 6))
+        row = ttk.Frame(game)
+        row.pack(fill="x")
+        ttk.Button(row, text="Save game...", command=self.add_place).pack(side="left")
+        ttk.Button(row, text="Delete", command=self.remove_place).pack(side="left", padx=4)
+        ttk.Label(game, text="Server (job) ID - optional:").pack(anchor="w", pady=(10, 0))
+        self.job_var = tk.StringVar()
+        ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
+        self.reload_places()
+
+        act = ttk.LabelFrame(right, text="Actions", padding=8)
+        act.pack(fill="x", pady=(10, 0))
+        for text, cmd in (
+            ("Launch selected", lambda: self.launch_accounts(self.selected_accounts())),
+            ("Join all accounts", lambda: self.launch_accounts(list(self.store.accounts))),
+            ("Stop selected", self.stop_selected),
+            ("Resume selected", self.resume_selected),
+            ("Toggle auto-rejoin (selected)", self.toggle_selected_rejoin),
+        ):
+            ttk.Button(act, text=text, command=cmd).pack(fill="x", pady=2)
+
+        acc = ttk.LabelFrame(right, text="Manage", padding=8)
+        acc.pack(fill="x", pady=(10, 0))
+        ttk.Button(acc, text="Add account...", command=self.add_account).pack(fill="x", pady=2)
+        ttk.Button(acc, text="Remove selected", command=self.remove_selected).pack(fill="x", pady=2)
+
+        # log + status bar
+        logf = ttk.LabelFrame(root, text="Log", padding=6)
+        logf.pack(fill="both", padx=10, pady=(8, 0))
+        self.log_text = ScrolledText(logf, height=9, state="disabled", wrap="word", font=("Consolas", 9))
+        self.log_text.pack(fill="both", expand=True)
+        for tag, color in (("bad", "#b00020"), ("ok", "#0a7d2c"), ("rejoin", "#1a56b0")):
+            self.log_text.tag_configure(tag, foreground=color)
+
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(root, textvariable=self.status_var, anchor="w", padding=(10, 4)).pack(fill="x")
+
+    # ---- periodic work --------------------------------------------------
+    def drain(self) -> None:
+        try:
+            while True:
+                try:
+                    self.ui_q.get_nowait()()
+                except queue.Empty:
+                    break
+                except Exception as exc:
+                    mi_log(f"[!] UI task error: {exc!r}")
+            lines = []
+            try:
+                while True:
+                    lines.append(self.log_q.get_nowait())
+            except queue.Empty:
+                pass
+            if lines:
+                self._append_log(lines)
+        finally:
+            if not self._closing:
+                self.root.after(100, self.drain)
+
+    def _append_log(self, lines: list[str]) -> None:
+        t = self.log_text
+        t.configure(state="normal")
+        for line in lines:
+            low = line.lower()
+            tag = "bad" if "[!]" in line or "error" in low else "ok" if "[ok]" in line \
+                else "rejoin" if "[rejoin]" in line else ""
+            t.insert("end", line + "\n", tag)
+        extra = int(t.index("end-1c").split(".")[0]) - LOG_MAX_LINES
+        if extra > 0:
+            t.delete("1.0", f"{extra + 1}.0")
+        t.see("end")
+        t.configure(state="disabled")
+
+    def refresh(self) -> None:
+        if self._closing:
+            return
+        accounts = self.store.accounts
+        existing = set(self.tree.get_children())
+        for iid in existing - {a.id for a in accounts}:
+            self.tree.delete(iid)
+        snap = self.client_snapshot()
+        now = self.manager.clock()
+        for idx, a in enumerate(accounts):
+            state, pid, started, attempts = snap.get(a.id, (None, None, 0.0, 0))
+            if a.id in self.launching:
+                label, tag = self.launching[a.id], "busy"
+            elif state:
+                label, tag = STATE_LABELS.get(state, (state, "idle"))
+            else:
+                label, tag = "Not running", "idle"
+            uptime = ""
+            if state == "running" and started:
+                secs = int(now - started)
+                uptime = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+            values = (label, a.lastGameName or (a.savedPlaceId or ""),
+                      "ON" if a.autoRejoinEnabled else "off", uptime)
+            if a.id in existing:
+                self.tree.item(a.id, text=a.username, values=values, tags=(tag,))
+            else:
+                self.tree.insert("", idx, iid=a.id, text=a.username, values=values, tags=(tag,))
+        self.update_header()
+        if self._restored:
+            self.sessions.save(self.manager.session_records(), clean=False)
+        self.root.after(1000, self.refresh)
+
+    def update_header(self) -> None:
+        on = self.holder.active
+        self.mi_btn.configure(text=f"Multi-Instance: {'ON' if on else 'OFF'}",
+                              style="On.TButton" if on else "Off.TButton")
+        total = len(self.store.accounts)
+        n = sum(1 for a in self.store.accounts if a.autoRejoinEnabled)
+        self.ar_btn.configure(text=f"Auto-Rejoin: {n}/{total}",
+                              style="On.TButton" if total and n == total else
+                              "Off.TButton" if n == 0 else "TButton")
+
+    # ---- startup / shutdown --------------------------------------------
+    def startup(self) -> None:
+        mi_log("[ok] Account manager started.")
+        ours = {r.get("pid") for r in self._boot_records if r.get("pid")}
+        after = lambda: self.ui(self._restore)  # multi-instance first, THEN recover/adopt sessions
+        if self.settings["autoEnableMultiInstance"]:
+            self.enable_multi(known_pids=ours, then=after)
+        else:
+            after()
+
+    def _restore(self) -> None:
+        if self._boot_records:
+            c = restore_sessions(self.manager, self.store, self._boot_records, self._boot_clean,
+                                 rejoin_after_crash=self.settings["rejoinAfterCrash"], log=mi_log)
+            mi_log(f"[ok] Sessions: {c['adopted']} re-attached, {c['recovered']} relaunching, "
+                   f"{c['dropped']} skipped" + ("" if self._boot_clean else " (last run did not exit cleanly)."))
+        self._boot_records = []
+        self._restored = True
+
+    def on_close(self) -> None:
+        if self.tray and self.settings["closeToTray"]:
+            self.root.withdraw()
+            return
+        self.quit(confirm=True)
+
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit(self, confirm: bool = False) -> None:
+        if confirm:
+            watching = [a for a in self.store.accounts
+                        if a.autoRejoinEnabled and a.id in self.client_snapshot()]
+            if watching and not messagebox.askyesno(
+                    "Quit?",
+                    "Auto-rejoin only works while this program is running.\n\n"
+                    "Open Roblox clients stay open, but they will no longer be rejoined, "
+                    "and multi-instance will be released.\n\nQuit anyway?"):
+                return
+        self._closing = True
+        if self._restored:
+            self.sessions.save(self.manager.session_records(), clean=True)  # a deliberate quit
+        self.manager.stop()
+        self.watcher.stop()
+        self.holder.disable()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+        self.root.destroy()
+
+    # ---- tray (optional) ------------------------------------------------
+    def _setup_tray(self) -> None:
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except ImportError:
+            return
+        try:
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle((4, 4, 60, 60), radius=12, fill=(35, 41, 70, 255))
+            d.polygon([(25, 18), (25, 46), (47, 32)], fill=(255, 255, 255, 255))
+            menu = pystray.Menu(
+                pystray.MenuItem("Show window", lambda: self.ui(self.show_window), default=True),
+                pystray.MenuItem("Quit", lambda: self.ui(self.quit)),
+            )
+            self.tray = pystray.Icon("RobloxAccountManager", img, APP_TITLE, menu)
+            self.tray.run_detached()
+        except Exception as exc:
+            self.tray = None
+            mi_log(f"[!] Tray icon unavailable: {exc!r}")
+
+    # ---- multi-instance -------------------------------------------------
+    def toggle_multi(self) -> None:
+        if self.holder.active:
+            self.holder.disable()
+            self.update_header()
+        else:
+            self.enable_multi()
+
+    def enable_multi(self, known_pids=frozenset(), then=None) -> None:
+        """`known_pids`: clients saved by an earlier run of this tool. Clients we launched
+        already share the singleton objects, so they do not need to be closed."""
+        ours = set(known_pids) | {v[1] for v in self.client_snapshot().values() if v[1]}
+        running = find_roblox_processes()
+        strangers = [(pid, name) for pid, name in running if pid not in ours]
+        if strangers:
+            if not messagebox.askyesno(
+                    "Close Roblox?",
+                    f"{len(strangers)} Roblox client(s) are running that this tool did not start. A client "
+                    "like that owns the singleton objects, so ALL running clients must be closed before "
+                    "multi-instance can work.\n\nAny open game will be disconnected. Close them now?"):
+                mi_log("[!] Multi-instance NOT enabled (Roblox was left running).")
+                if then:
+                    then()
+                return
+            self.holder.force = True  # skips the console prompt in SingletonHolder
+        trust = bool(running) and not strangers
+
+        def work() -> None:
+            try:
+                self.holder.enable(trust_running=trust)
+            finally:
+                self.holder.force = False
+
+                def done() -> None:
+                    self.update_header()
+                    if then:
+                        then()
+                self.ui(done)
+        self.run_bg(work)
+
+    # ---- launching ------------------------------------------------------
+    def resolve_place(self, accounts: list) -> int | None:
+        raw = self.place_var.get().strip()
+        if not raw:
+            for a in accounts:
+                if a.savedPlaceId:
+                    return a.savedPlaceId
+            messagebox.showinfo("Pick a game", "Choose a saved game, or paste a place ID / roblox.com link.")
+            return None
+        saved = self.places.find(raw)
+        if saved:
+            return saved.placeId
+        place_id, _ = parse_place_input(raw)
+        if place_id is None:
+            messagebox.showwarning("Unknown game", "That is not a saved game, a place ID, or a roblox.com game link.")
+        return place_id
+
+    def launch_accounts(self, accounts: list) -> None:
+        if not accounts:
+            messagebox.showinfo("Launch", "Select one or more accounts first.")
+            return
+        place_id = self.resolve_place(accounts)
+        if place_id is None:
+            return
+        job_id = self.job_var.get().strip() or None
+        if job_id and len(job_id) < 8:
+            mi_log("[!] That doesn't look like a job ID; ignoring it.")
+            job_id = None
+
+        snap = self.client_snapshot()
+        todo = []
+        for a in accounts:
+            if a.id in self.launching or snap.get(a.id, ("",))[0] in ("starting", "running", "rejoining"):
+                mi_log(f"[!] {a.username} is already running - skipped (use Stop first).")
+            else:
+                todo.append(a)
+        if not todo:
+            return
+
+        running = len(find_roblox_processes())
+        if not self.holder.active and (running or len(todo) > 1) and not messagebox.askyesno(
+                "Multi-instance is OFF",
+                "A new client will replace the one that is already running (or each other).\n\n"
+                "Launch anyway?"):
+            return
+        if running + len(todo) > PERF_WARN_CLIENTS and not messagebox.askokcancel(
+                "Heavy load",
+                f"This would run about {running + len(todo)} Roblox clients at once. "
+                "Each one uses a lot of CPU, RAM and GPU.\n\nContinue?"):
+            return
+
+        for a in todo:
+            self.launching[a.id] = "Queued..."
+        self.run_bg(self._launch_worker, todo, place_id, job_id)
+
+    def _launch_worker(self, accounts: list, place_id: int, job_id: str | None) -> None:
+        total = len(accounts)
+        for n, a in enumerate(accounts, 1):
+            self.launching[a.id] = "Launching..."
+            self.set_status(f"Launching {a.username} ({n}/{total})...")
+            try:
+                self.manager.launch(a, place_id, job_id)  # waits for the client + settle pause
+                mi_log(f"[ok] {a.username} is running.")
+            except LaunchError as exc:
+                mi_log(f"[!] {a.username}: {exc}")
+            except Exception as exc:
+                mi_log(f"[!] {a.username}: unexpected error {exc!r}")
+            finally:
+                self.launching.pop(a.id, None)
+        self.set_status("Ready")
+
+    def stop_selected(self) -> None:
+        accounts = self.selected_accounts()
+        if not accounts:
+            return
+
+        def work() -> None:
+            for a in accounts:
+                if not self.manager.stop_account(a):
+                    mi_log(f"[!] {a.username} has no running client.")
+        self.run_bg(work)
+
+    def resume_selected(self) -> None:
+        for a in self.selected_accounts():
+            if self.manager.resume(a):
+                mi_log(f"[ok] {a.username}: trying again.")
+            else:
+                mi_log(f"[!] {a.username}: nothing to resume.")
+
+    # ---- auto-rejoin ----------------------------------------------------
+    def toggle_selected_rejoin(self) -> None:
+        accounts = self.selected_accounts()
+        if not accounts:
+            return
+        enable = not all(a.autoRejoinEnabled for a in accounts)
+        for a in accounts:
+            self.manager.set_enabled(a, enable)
+        self.update_header()
+
+    def toggle_all_rejoin(self) -> None:
+        accounts = self.store.accounts
+        if not accounts:
+            return
+        enable = not all(a.autoRejoinEnabled for a in accounts)
+        for a in accounts:
+            self.manager.set_enabled(a, enable)
+        self.update_header()
+
+    # ---- accounts -------------------------------------------------------
+    def add_account(self) -> None:
+        raw = simpledialog.askstring(
+            "Add account", "Paste the .ROBLOSECURITY cookie (hidden):", show="*", parent=self.root)
+        if not raw:
+            return
+        self.set_status("Verifying cookie with Roblox...")
+
+        def work() -> None:
+            try:
+                account, updated = self.store.add_from_cookie(raw)
+                verb = "Updated cookie for" if updated else "Added"
+                mi_log(f"[ok] {verb} {account.username} (userId {account.userId}). Cookie stored encrypted.")
+            except CookieError as exc:
+                self.ui(lambda: messagebox.showerror("Could not add account", str(exc)))
+            except OSError as exc:
+                self.ui(lambda: messagebox.showerror("Could not encrypt/save", str(exc)))
+            finally:
+                self.set_status("Ready")
+        self.run_bg(work)
+
+    def remove_selected(self) -> None:
+        accounts = self.selected_accounts()
+        if not accounts:
+            return
+        names = ", ".join(a.username for a in accounts)
+        if not messagebox.askyesno("Remove", f"Remove from this tool: {names}?\n(Their Roblox accounts are not affected.)"):
+            return
+        for a in accounts:
+            self.manager.stop_account(a)  # also stops auto-rejoin from reviving it
+            self.store.remove(a)
+        mi_log(f"[ok] Removed: {names}")
+
+    # ---- places ---------------------------------------------------------
+    def reload_places(self, select=None) -> None:
+        self.place_cb["values"] = [p.name for p in self.places.places]
+        if select:
+            self.place_var.set(select.name)
+
+    def add_place(self) -> None:
+        raw = simpledialog.askstring(
+            "Save game", "Paste the game's roblox.com link or place ID:", parent=self.root)
+        if not raw:
+            return
+        place_id, slug_name = parse_place_input(raw)
+        if place_id is None:
+            messagebox.showwarning("Save game", "Couldn't find a place ID in that.")
+            return
+        self.set_status("Looking up the game name...")
+
+        def work() -> None:
+            name = fetch_place_name(place_id) or slug_name
+            self.ui(lambda: self._finish_add_place(place_id, name))
+        self.run_bg(work)
+
+    def _finish_add_place(self, place_id: int, name: str | None) -> None:
+        self.status_var.set("Ready")
+        name = simpledialog.askstring(
+            "Save game", "Name for this game:", initialvalue=name or f"Place {place_id}", parent=self.root)
+        if name is None:
+            return
+        place, updated = self.places.add(place_id, name.strip() or f"Place {place_id}")
+        self.reload_places(select=place)
+        mi_log(f"[ok] {'Updated' if updated else 'Saved'} game: {place.name} (place {place.placeId})")
+
+    def remove_place(self) -> None:
+        place = self.places.find(self.place_var.get())
+        if not place:
+            messagebox.showinfo("Delete game", "Pick one of your saved games in the box first.")
+            return
+        if messagebox.askyesno("Delete game", f"Delete '{place.name}' from your saved games?"):
+            self.places.remove(place)
+            self.place_var.set("")
+            self.reload_places()
+
+    # ---- tree events ----------------------------------------------------
+    def on_double_click(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self.launch_accounts(self.selected_accounts())
+
+    def on_right_click(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        if self.tree.selection():
+            self.menu.tk_popup(event.x_root, event.y_root)
+
+    # ---- diagnostics ----------------------------------------------------
+    def open_diagnostics(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Diagnostics")
+        win.geometry("780x540")
+        text = ScrolledText(win, font=("Consolas", 9), wrap="word", state="disabled")
+        text.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        report = {"text": ""}
+
+        def show(content: str) -> None:
+            try:
+                text.configure(state="normal")
+                text.delete("1.0", "end")
+                text.insert("end", content)
+                text.configure(state="disabled")
+            except tk.TclError:  # window was closed while a check was running
+                pass
+
+        def run() -> None:
+            show("Running checks...")
+
+            def work() -> None:
+                try:
+                    results = diagnostics.run_all(
+                        store=self.store, holder=self.holder, include_network=True,
+                        progress=lambda m: self.ui(lambda m=m: show(m)))
+                    report["text"] = diagnostics.format_report(results)
+                except Exception as exc:
+                    report["text"] = f"Diagnostics failed: {exc!r}"
+                self.ui(lambda: show(report["text"]))
+            self.run_bg(work)
+
+        def copy() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report["text"])
+            self.set_status("Report copied to the clipboard.")
+
+        def save() -> None:
+            path = DATA_DIR / "diagnostics_report.txt"
+            try:
+                path.write_text(report["text"], encoding="utf-8")
+                messagebox.showinfo("Saved", f"Saved to:\n{path}", parent=win)
+            except OSError as exc:
+                messagebox.showerror("Save failed", str(exc), parent=win)
+
+        bar = ttk.Frame(win, padding=(8, 0, 8, 8))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Run again", command=run).pack(side="left")
+        ttk.Button(bar, text="Copy report", command=copy).pack(side="left", padx=6)
+        ttk.Button(bar, text="Save as file", command=save).pack(side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        run()
+
+    # ---- settings dialog ------------------------------------------------
+    def open_settings(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.transient(self.root)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack()
+
+        spins = (
+            ("rejoinCooldown", "Wait before rejoining (seconds)", 1, 120),
+            ("maxAttempts", "Max rejoin attempts", 1, 20),
+            ("attemptWindowMinutes", "...within this many minutes", 1, 120),
+            ("presencePollSeconds", "Check Roblox presence every (seconds)", 15, 300),
+            ("launchPauseSeconds", "Pause after each launch (seconds)", 2, 60),
+        )
+        vars_: dict[str, tk.Variable] = {}
+        row = 0
+        for key, label, lo, hi in spins:
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            v = tk.IntVar(value=self.settings[key])
+            vars_[key] = v
+            ttk.Spinbox(frm, from_=lo, to=hi, textvariable=v, width=6).grid(row=row, column=1, padx=(12, 0))
+            row += 1
+
+        checks = (
+            ("autoEnableMultiInstance", "Turn multi-instance on when the app starts"),
+            ("closeToTray", "Closing the window keeps running in the tray"),
+            ("restoreSessions", "On startup, re-attach to Roblox clients that are still running"),
+            ("rejoinAfterCrash", "After a crash, relaunch auto-rejoin accounts that were in a game"),
+        )
+        bools: dict[str, tk.BooleanVar] = {}
+        for i, (key, label) in enumerate(checks):
+            bools[key] = tk.BooleanVar(value=self.settings[key])
+            ttk.Checkbutton(frm, text=label, variable=bools[key]).grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(10 if i == 0 else 0, 0))
+            row += 1
+        if not self.tray:
+            ttk.Label(frm, foreground="#777777", text="(Tray needs: pip install pystray pillow)"
+                      ).grid(row=row, column=0, columnspan=2, sticky="w")
+            row += 1
+
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(frm, text="Advanced - Roblox object names (comma separated). Change only if a Roblox "
+                            "update breaks multi-instance; Diagnostics shows the names it finds. "
+                            "Switch multi-instance off and on afterwards.",
+                  foreground="#777777", wraplength=420, justify="left").grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        names: dict[str, tk.StringVar] = {}
+        for key, label in (("mutexNames", "Mutex name(s)"), ("eventNames", "Event name(s)")):
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            names[key] = tk.StringVar(value=self.settings[key])
+            ttk.Entry(frm, textvariable=names[key], width=34).grid(row=row, column=1, padx=(12, 0))
+            row += 1
+
+        def save() -> None:
+            try:
+                for key, label, lo, hi in spins:
+                    value = int(vars_[key].get())
+                    if not lo <= value <= hi:
+                        raise ValueError(f"{label}: use {lo}-{hi}")
+                    self.settings[key] = value
+            except (ValueError, tk.TclError) as exc:
+                messagebox.showwarning("Settings", f"Invalid value. {exc}", parent=win)
+                return
+            for key, var in bools.items():
+                self.settings[key] = bool(var.get())
+            for key, var in names.items():
+                self.settings[key] = var.get().strip() or DEFAULTS[key]
+            self.settings.apply()
+            try:
+                self.settings.save()
+            except OSError as exc:
+                messagebox.showwarning("Settings", f"Applied, but could not save: {exc}", parent=win)
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Save", command=save).pack(side="right", padx=6)
+        win.grab_set()
+
+
+_APP_LOCK = None  # keeps the single-copy mutex handle alive for the life of the process
+
+
+def _acquire_app_lock() -> bool:
+    """False if another copy of this app is already running (two copies would fight over
+    the singleton mutex and rejoin the same accounts twice)."""
+    global _APP_LOCK
+    _APP_LOCK = multi_instance.kernel32.CreateMutexW(None, False, "RobloxAccountManager.GUI.singleton")
+    return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+
+def main() -> None:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
+    except Exception:
+        pass
+    root = tk.Tk()
+    if not _acquire_app_lock():
+        root.withdraw()
+        messagebox.showerror(APP_TITLE, "The account manager is already running (look in the system tray "
+                                        "or the taskbar).")
+        root.destroy()
+        return
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+dist
+build
+__pycache__
+*.pyc
+RobloxAccountManager.spec
+multi_instance.log
