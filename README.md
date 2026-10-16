@@ -1,5 +1,7 @@
 # Roblox Account Manager
 
+Version 2.0.0 (see [CHANGELOG.md](CHANGELOG.md))
+
 A Windows desktop app for managing and running multiple of your own Roblox accounts at the same time. Save accounts once, launch them into any game with one click, and let the built-in auto-rejoin keep them connected.
 
 Written in pure Python with no third-party dependencies required (the system tray icon is an optional extra).
@@ -33,8 +35,33 @@ Written in pure Python with no third-party dependencies required (the system tra
 - Session state is saved continuously. After an app restart, clients that are still running are re-attached automatically (with protection against recycled process IDs).
 - After an unclean exit such as a crash or power loss, dead clients for accounts with auto-rejoin on are relaunched. After a normal quit they are left alone.
 
+**Groups and notes**
+- Give each account a group and a short note. Filter the table by group, launch a whole group with one click, and set a default game per group (it is used when the Game box is empty).
+- Console selection accepts `group:<name>`; `setgroup` and `setnote` edit them.
+
+**Notifications**
+- Alerts for disconnects, auto-rejoin giving up, and expired cookies, sent to a Discord webhook and/or the system tray. Each event is rate-limited per account (default 120 s).
+- The webhook URL is stored encrypted with DPAPI in `secrets.json`, never in `settings.json`, and is redacted from logs and diagnostics. Messages never ping anyone.
+
+**Join tools** (Game box, **Find server...**)
+- Server finder: pick the emptiest, fullest, "best" (fullest that is not full) or a minimum-player server and drop its job ID into the Game box.
+- Friend join: look up a friend by username or ID and join their server (shows "unavailable" when their privacy settings hide it).
+- Private servers (experimental): paste a private-server or share link. The code is kept in memory only, so after a crash the client is re-attached but not relaunched.
+
+**Resource saver**
+- Normal, Low and Minimum profiles write client flags (currently an FPS cap) before each launch. The original `ClientAppSettings.json` is backed up once and **Restore original** puts back the exact bytes (or deletes the file if there was none).
+- Roblox honours only some flags and can change them; the profile table in `resourcesaver.py` is meant to be edited.
+
+**Window layout**
+- Tile all client windows in a grid on a chosen monitor (columns and gap configurable), or minimize and restore them all. Optional auto-tile re-tiles when a client starts or rejoins. Fullscreen clients are skipped.
+
+**Scheduler**
+- Start or stop an account or group at a time of day on chosen weekdays. A stop is intentional, so auto-rejoin does not revive it.
+- A run missed while the app was closed or the PC slept fires once if it is still inside the missed-run window (default 30 minutes); it never repeats.
+- Scheduled starts skip accounts already running and, if multi-instance is off, skip multi-client launches instead of prompting.
+
 **Diagnostics**
-- One button checks everything the app depends on: Python bitness, administrator rights, data files, DPAPI, Roblox install (including the Microsoft Store version, which cannot multi-instance), log naming, Roblox web endpoints, multi-instance state, the Roblox mutex and event names present in running clients, and every saved cookie.
+- One button checks everything the app depends on (including groups, notifications, join tools, resource saver, layout and scheduler): Python bitness, administrator rights, data files, DPAPI, Roblox install (including the Microsoft Store version, which cannot multi-instance), log naming, Roblox web endpoints, multi-instance state, the Roblox mutex and event names present in running clients, and every saved cookie.
 - The report is passed through a redactor and is safe to paste when asking for help.
 
 **Interface**
@@ -54,19 +81,21 @@ Written in pure Python with no third-party dependencies required (the system tra
 - Roblox installed from [roblox.com](https://www.roblox.com). The Microsoft Store version is not supported because it cannot run multiple clients.
 - Administrator rights are recommended. Closing the singleton event inside Roblox clients can fail without them.
 
-Optional, for the system tray:
+Optional, for the system tray (and tray notifications):
 
 ```
 pip install pystray pillow
 ```
+
+Or skip Python entirely and use the packaged exe (see **Building the exe**).
 
 ---
 
 ## Installation
 
 ```
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/devjeo/multiblox.git
+cd multiblox
 python gui.py
 ```
 
@@ -100,6 +129,7 @@ Treat a cookie like a password. Anyone who has it can use that account. Never sh
 |---|---|---|
 | Auto-enable multi-instance | On | Turn multi-instance on at startup |
 | Close to tray | On | Closing the window keeps the app running in the tray |
+| Theme | Dark | Dark or light; the moon/sun button in the header switches it |
 | Rejoin cooldown | 8 s | Wait before relaunching a disconnected client |
 | Max attempts | 5 | Rejoin attempts allowed per window |
 | Attempt window | 10 min | Window over which attempts are counted |
@@ -108,6 +138,17 @@ Treat a cookie like a password. Anyone who has it can use that account. Never sh
 | Restore sessions | On | Re-attach to surviving clients on startup |
 | Rejoin after crash | On | Relaunch dead clients after an unclean exit |
 | Mutex names / Event names | Roblox defaults | Comma separated; change if a Roblox update renames them |
+| Confirm actions | On | Ask before stopping clients and bulk launches |
+| Notify events | disconnect, rejoin_gaveup, cookie_invalid | Which events send a notification |
+| Discord / Tray notifications | Off / On | Channels to send to (webhook URL is stored encrypted, not here) |
+| Notification cooldown | 120 s | Minimum gap between the same event for the same account (1-3600) |
+| Group games | none | Default game per group, set from the right-click menu |
+| Performance profile | Normal | Normal, Low or Minimum client flags |
+| Apply profile before launch | Off | Write the profile before every launch, rejoin and scheduled start |
+| Layout monitor / columns / gap | 0 / 3 / 4 px | Where and how Tile windows arranges clients |
+| Auto-tile | Off | Re-tile when a client starts or rejoins |
+| Scheduler enabled | On | Run schedule rules (checked every 30 s) |
+| Missed-run window | 30 min | How late a missed scheduled run may still fire |
 
 ---
 
@@ -120,11 +161,16 @@ Everything is stored locally in `%APPDATA%\RobloxAccountManager\`:
 | `accounts.json` | Accounts with DPAPI-encrypted cookies |
 | `places.json` | Saved games |
 | `settings.json` | Your settings |
-| `sessions.json` | Which account is in which game and client, for recovery |
+| `sessions.json` | Which account is in which game and client, for recovery (private-server codes are never saved) |
+| `secrets.json` | DPAPI-encrypted secrets, currently the Discord webhook URL |
+| `schedules.json` | Scheduler rules and when each last ran |
+| `resource_backup.json` | Original client-settings backup for Restore original |
+| `multi_instance.log`, `rejoin_debug.log` | Size-capped logs (the second only when a disconnect marker fires) |
+| `diagnostics_report.txt` | Last saved diagnostics report |
 
-Log files (`multi_instance.log`, and `rejoin_debug.log` when a disconnect marker fires) are written next to the scripts, size-capped, and pass through the redactor. Launch tickets, cookies, CSRF tokens, and other long token-like strings are replaced with `<redacted>`.
+Back up this folder before upgrading; `accounts.json` holds your encrypted cookies. Everything passes through the redactor: launch tickets, cookies, CSRF tokens, Discord webhook URLs, private-server codes and other long token-like strings become `<redacted>`.
 
-The only network traffic goes to Roblox's own endpoints. Nothing is sent anywhere else.
+Network traffic goes to Roblox's own endpoints, plus the Discord webhook you configure if you turn Discord notifications on. Nothing else is contacted.
 
 ---
 
@@ -134,10 +180,11 @@ The GUI is built on modules that also work on their own:
 
 | Command | Purpose |
 |---|---|
-| `python launcher.py` | Console launcher with `launch`, `joinall`, `autorejoin`, `stop`, `resume`, `status`, and place commands |
+| `python launcher.py` | Console launcher with `launch`, `joinall`, `autorejoin`, `stop`, `resume`, `status`, `setgroup`, `setnote`, and place commands (select with numbers, names, `all` or `group:<name>`) |
 | `python account_store.py` | Console account manager (`add`, `list`, `check`, `remove`) |
 | `python multi_instance.py` | Standalone multi-instance holder and process watcher |
 | `python diagnostics.py [--offline]` | Print the diagnostics report |
+| `python resourcesaver.py apply <profile>` / `restore` | Apply or undo a performance profile |
 
 Do not run `launcher.py` or `multi_instance.py` while the GUI is open. They would compete for the same singleton objects.
 
@@ -146,29 +193,68 @@ Do not run `launcher.py` or `multi_instance.py` while the GUI is open. They woul
 ## Project layout
 
 ```
-gui.py            Tkinter desktop app
-launcher.py       Auth tickets, launch links, console launcher
-autorejoin.py     Disconnect detection and rejoin logic
-multi_instance.py Singleton mutex/event handling and process watcher
-account_store.py  DPAPI-encrypted account storage
-places.py         Saved games and link/ID parsing
-sessions.py       Crash and restart recovery
-diagnostics.py    Environment and dependency checks
-safelog.py        Secret redaction for logs and reports
-test_phase6.py    Test suite
+gui.py              Tkinter desktop app
+theme.py            Design tokens: spacing, type scale, contrast-checked colours (pure)
+ui_style.py         Applies the tokens to ttk (styles, tooltips, menus)
+icons.py            Icon set drawn from geometry, encoded as PNG (no image files)
+join_dialog.py      Find server / Join friend / Private server dialog
+schedule_window.py  Schedule list and rule editor
+settings.py         Settings and defaults (no Tk, testable anywhere)
+version.py          App version
+launcher.py         Auth tickets, launch links, console launcher
+autorejoin.py       Disconnect detection and rejoin logic
+multi_instance.py   Singleton mutex/event handling and process watcher
+account_store.py    DPAPI-encrypted account storage, groups and notes
+groups.py           Group filtering and launch-target resolution (pure)
+places.py           Saved games and link/ID parsing
+sessions.py         Crash and restart recovery
+notifier.py         Notification queue, cooldown and filtering
+notify_discord.py   Discord webhook channel
+notify_tray.py      System tray channel
+secrets_store.py    DPAPI-encrypted named secrets
+server_finder.py    Public server list and selection
+friends.py          User lookup and friend presence
+private_links.py    Private-server and share-link parsing (experimental)
+resourcesaver.py    Client-flag profiles with backup and restore
+winapi.py           Win32 window and monitor access (lazy, Windows only)
+winlayout.py        Grid maths and tiling (pure)
+scheduler.py        Rule store and due-run logic
+net.py              HTTP with retries and the CSRF handshake (new code)
+workers.py          Background worker thread
+jsonio.py           Atomic JSON read/write
+diagnostics.py      Environment and dependency checks
+safelog.py          Secret redaction for logs and reports
+RobloxAccountManager.spec   PyInstaller build recipe
+installer.iss       Inno Setup script that wraps the exe into a Setup installer
+CHANGELOG.md        Release notes
+LICENSE             MIT license
+test_*.py           Test suites
 ```
+
+---
+
+## Building the exe
+
+On Windows, in a clean virtual environment with 64-bit Python:
+
+```
+pip install pyinstaller pystray pillow
+pyinstaller --clean --noconfirm RobloxAccountManager.spec
+```
+
+The result is `dist\RobloxAccountManager.exe`. The spec lists every module explicitly because some dialogs are imported on demand. Data and logs go to `%APPDATA%\RobloxAccountManager\`, not next to the exe. Run the exe as administrator for best multi-instance results (or set `uac_admin=True` in the spec). To make a shareable installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run `ISCC.exe installer.iss` (or open `installer.iss` in Inno Setup and press F9). The result is `installer_output\RobloxAccountManager-Setup-2.0.0.exe`. Uninstalling removes the program but keeps `%APPDATA%\RobloxAccountManager`. Antivirus tools sometimes flag unsigned PyInstaller apps; building from source yourself is the safest way to trust the result.
 
 ---
 
 ## Testing
 
-The test suite needs neither Windows nor Roblox. The rejoin manager takes its clock, sleep, process list, launcher, and presence lookup as parameters, so a simulated machine stands in and time moves instantly.
+The test suite needs neither Windows nor Roblox nor a network. The rejoin manager and scheduler take their clock, sleep, process list, launcher and presence lookup as parameters, so a simulated machine stands in and time moves instantly.
 
 ```
-python -m unittest test_phase6 -v
+python -m unittest discover -p "test_*.py"
 ```
 
-41 tests cover rejoin behavior (retry limits, same-server-first, cancellation, many accounts crashing at once, teleport handling), session recovery, secret redaction, link parsing, the CSRF handshake, log matching, and diagnostics.
+317 tests cover rejoin behaviour, session recovery, secret redaction, link parsing, the CSRF handshake, groups, notifications, server finding, resource-saver backup and restore, window grid maths, scheduling (including missed runs, midnight and daylight-saving changes), diagnostics, and release hygiene.
 
 ---
 
@@ -181,6 +267,10 @@ Open **Diagnostics...** first. It reports which piece broke.
 - **Account shows an expired cookie.** Log in again in a private window, copy a fresh cookie, and use Add account. The existing entry is updated in place.
 - **Cannot decrypt a cookie.** The file was saved by a different Windows user or on a different PC. Accounts must be re-added.
 - **Auto-rejoin misfires.** Tune the disconnect markers in `autorejoin.py` using the lines saved to `rejoin_debug.log`.
+- **No Discord message.** Press Test in Settings. A webhook must be a `discord.com` or `discordapp.com` webhook URL.
+- **Resource saver does nothing.** Roblox ignores flags it does not allow. Check Diagnostics for the file it found, and use Restore original to undo.
+- **Windows will not tile.** Fullscreen clients are skipped, and clients take a few seconds to create their window.
+- **Scheduled run did not start.** Check the rule's days, that the app was running within the missed-run window, and the log for "skipped" lines.
 
 ---
 
@@ -190,4 +280,4 @@ This is an independent project and is not affiliated with, endorsed by, or spons
 
 ## License
 
-Add your license here (for example MIT) and a `LICENSE` file to the repository.
+MIT. See [LICENSE](LICENSE). The license covers this code only; it gives no rights to Roblox or its trademarks.

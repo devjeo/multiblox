@@ -34,6 +34,7 @@ from pathlib import Path
 import groups
 from account_store import DATA_DIR
 from safelog import redact
+from version import __version__
 
 ON_WINDOWS = sys.platform == "win32"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobloxAccountManager/0.6"
@@ -521,7 +522,7 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
 
 def format_report(results: list[Result]) -> str:
     tags = {"OK": "[ OK ]", "WARN": "[WARN]", "FAIL": "[FAIL]", "INFO": "[info]", "SKIP": "[skip]"}
-    lines = [f"Roblox Account Manager diagnostics - {datetime.now().isoformat(timespec='seconds')}",
+    lines = [f"Roblox Account Manager {__version__} diagnostics - {datetime.now().isoformat(timespec='seconds')}",
              f"Python {sys.version.split()[0]} on {sys.platform}", ""]
     for r in results:
         lines.append(f"{tags[r.level]} {r.name}" + (f": {r.detail}" if r.detail else ""))

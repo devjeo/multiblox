@@ -4,7 +4,7 @@ Phase 1: Roblox multi-instance proof of concept (Windows only).
 While this program is running, it holds the named Win32 mutex that the Roblox
 client checks at startup, so additional clients are allowed to launch. A
 background watcher logs every Roblox process that starts or closes, to the
-console and to multi_instance.log (next to this script).
+console and to multi_instance.log (in %APPDATA%\RobloxAccountManager).
 
 Usage:
     python multi_instance.py                # asks before closing running Roblox clients
@@ -34,6 +34,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
+from account_store import DATA_DIR
 from safelog import redact
 
 if sys.platform != "win32":
@@ -48,7 +49,7 @@ DUPLICATE_CLOSE_SOURCE = 0x1
 DUPLICATE_SAME_ACCESS = 0x2
 STILL_ACTIVE = 259
 
-LOG_PATH = Path(__file__).with_name("multi_instance.log")
+LOG_PATH = DATA_DIR / "multi_instance.log"   # under %APPDATA%, not next to the script (breaks in a PyInstaller exe)
 LOG_MAX_BYTES = 1_000_000  # rotated to multi_instance.log.1 beyond this, so it never grows forever
 
 # Names Roblox has used for its single-instance check. Kept in lists because
@@ -127,6 +128,7 @@ def log(message: str) -> None:
     with _log_lock:
         print(line, flush=True)
         try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             try:
                 if LOG_PATH.stat().st_size > LOG_MAX_BYTES:
                     os.replace(LOG_PATH, LOG_PATH.with_name(LOG_PATH.name + ".1"))

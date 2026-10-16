@@ -50,7 +50,7 @@ class JoinDialog(tk.Toplevel):
     def _build_finder(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Looks at the game in the main window's Game box (or the selected account's "
                                "last game) and lists its public servers.",
-                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w")
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w")
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(8, 0))
         ttk.Label(row, text="Pick:").pack(side="left")
@@ -94,7 +94,7 @@ class JoinDialog(tk.Toplevel):
                                "into it. Uses the first selected account to ask Roblox, so select an account in "
                                "the main window first. Roblox only shows a server to accounts the friend "
                                "allows to join them.",
-                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w")
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w")
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(10, 0))
         ttk.Label(row, text="Username or ID:").pack(side="left")
@@ -106,7 +106,7 @@ class JoinDialog(tk.Toplevel):
         self.lookup_btn.pack(side="left")
 
         self.friend_name_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self.friend_name_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 0))
+        ttk.Label(parent, textvariable=self.friend_name_var, style="Heading.TLabel").pack(anchor="w", pady=(14, 0))
         self.friend_status_var = tk.StringVar(value="Type a username (or a user ID / profile link) and press Look up.")
         ttk.Label(parent, textvariable=self.friend_status_var, wraplength=560, justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -121,7 +121,7 @@ class JoinDialog(tk.Toplevel):
                                "Private Servers list, then Join), copy the roblox-player:... text that "
                                "appears, and paste it here. The app keeps only the place and the server code "
                                "(in memory, never saved) and discards the login ticket in it.",
-                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w")
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w")
         self.private_var = tk.StringVar()
         entry = ttk.Entry(parent, textvariable=self.private_var)
         entry.pack(fill="x", pady=(10, 0))
@@ -131,7 +131,7 @@ class JoinDialog(tk.Toplevel):
         ttk.Label(parent, textvariable=self.private_status_var, wraplength=560, justify="left").pack(anchor="w", pady=(10, 0))
         ttk.Label(parent, text="While armed, Launch selected joins this private server and auto-rejoin returns "
                                "to it (never to a public server). Editing the Game or Server box un-arms it.",
-                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w", pady=(10, 0))
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w", pady=(10, 0))
         bottom = ttk.Frame(parent)
         bottom.pack(side="bottom", fill="x")
         ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")

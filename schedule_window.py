@@ -38,9 +38,10 @@ class ScheduleWindow(tk.Toplevel):
         bar.pack(fill="x")
         for text, cmd in (("Add...", self.add), ("Edit...", self.edit), ("Turn on/off", self.toggle),
                           ("Delete", self.delete), ("Run now", self.run_now)):
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+            ttk.Button(bar, text=text, command=cmd,
+                       style="Danger.TButton" if text == "Delete" else "TButton").pack(side="left", padx=(0, 6))
         ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
-        self.hint = ttk.Label(bar, foreground="#777777")
+        self.hint = ttk.Label(bar, style="Muted.TLabel")
         self.hint.pack(side="right", padx=10)
         self.refresh()
 
@@ -89,7 +90,8 @@ class ScheduleWindow(tk.Toplevel):
 
     def run_now(self) -> None:
         rule = self._selected()
-        if rule:
+        if rule and self.app.confirm("Run now?", f"Run this rule now?\n\n{scheduler.Scheduler.describe(rule)}",
+                                     parent=self):
             self.app.scheduler.run_now(rule)
 
     def commit(self, old, new) -> None:
@@ -155,7 +157,7 @@ class RuleEditor(tk.Toplevel):
         ttk.Label(frm, text="Server (job) ID, optional").grid(row=r, column=0, sticky="w", pady=3)
         ttk.Entry(frm, textvariable=self.job, width=28).grid(row=r, column=1, sticky="w")
         r += 1
-        ttk.Label(frm, foreground="#777777", wraplength=380, justify="left",
+        ttk.Label(frm, style="Muted.TLabel", wraplength=380, justify="left",
                   text="Leave the game empty to use the group's default game, or the game an account "
                        "last played.").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
         r += 1

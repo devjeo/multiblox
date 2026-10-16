@@ -1,6 +1,8 @@
-dist
-build
-__pycache__
+buildenv/
+build/
+dist/
+installer_output/
+__pycache__/
 *.pyc
-RobloxAccountManager.spec
-multi_instance.log
+*.log
+*.tmp

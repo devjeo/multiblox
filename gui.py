@@ -53,6 +53,9 @@ import scheduler
 import winapi
 import winlayout
 import secrets_store
+import theme
+import ui_style
+from icons import IconSet
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
 from launcher import LaunchError, _running_pids, kill_pid, launch_account
@@ -315,81 +318,177 @@ class App:
         self.notifier.reconfigure(self._notify_channels(), self.settings["notifyEvents"],
                                   self.settings["notifyCooldownSeconds"])
 
+    def confirm(self, title: str, message: str, parent=None) -> bool:
+        """Asks before a disruptive action (default answer: No). The Settings > General box turns it off."""
+        if not self.settings["confirmActions"]:
+            return True
+        return messagebox.askyesno(title, message, icon="warning", default="no", parent=parent or self.root)
+
     def selected_accounts(self) -> list:
         chosen = set(self.tree.selection())
         return [a for a in self.store.accounts if a.id in chosen]
 
     # ---- UI construction ------------------------------------------------
+    # Every size below comes from theme.py (4 px grid, golden-ratio split, modular type scale).
+    def ico(self, name: str, kind: str = "text"):
+        color = {"accent": self.pal["accentText"], "danger": self.pal["st_bad"]}.get(kind, self.pal["text"])
+        return self.icons.get(name, color)
+
+    def icon_button(self, parent, text: str, icon: str, command, style: str = "TButton",
+                    tip: str | None = None, **kw) -> ttk.Button:
+        kind = "accent" if style.startswith("Accent") else "danger" if style.startswith("Danger") else "text"
+        b = ttk.Button(parent, text=text, image=self.ico(icon, kind), compound="left",
+                       command=command, style=style, **kw)
+        self._icon_widgets.append((b, icon, kind))
+        if tip:
+            ui_style.Tooltip(b, tip, self.pal)
+        return b
+
+    def card(self, parent, title: str | None = None, hint: str | None = None) -> ttk.Frame:
+        """A raised panel with an optional heading. Returns the inner frame to pack things into."""
+        outer = ttk.Frame(parent, style="Card.TFrame")
+        inner = ttk.Frame(outer, style="Surface.TFrame", padding=theme.space(4))
+        inner.pack(fill="both", expand=True)
+        if title:
+            ttk.Label(inner, text=title, style="CardHeading.TLabel").pack(anchor="w")
+            if hint:
+                ttk.Label(inner, text=hint, style="CardMuted.TLabel", wraplength=theme.space(70),
+                          justify="left").pack(anchor="w", pady=(theme.space(1), 0))
+            ttk.Frame(inner, style="Surface.TFrame", height=theme.space(2)).pack()
+        inner.outer = outer  # callers grid/pack `.outer`
+        return inner
+
+    def _tag_colors(self) -> None:
+        p = self.pal
+        for tag in ("ok", "busy", "bad", "idle"):
+            self.tree.tag_configure(tag, foreground=p["st_" + tag])
+        self.tree.tag_configure("alt", background=theme.mix(p["surface"], p["text"], 0.035))
+        accent_text = theme.readable(p["accent"], p["surface"])
+        for tag, color in (("bad", p["st_bad"]), ("ok", p["st_ok"]), ("rejoin", accent_text)):
+            self.log_text.tag_configure(tag, foreground=color)
+
+    def _draw_logo(self) -> None:
+        c, p, s = self.logo, self.pal, theme.space(8)
+        c.delete("all")
+        c.configure(background=p["surface"])
+        r = theme.space(2)
+        pts = [(0, r), (r, 0), (s - r, 0), (s, r), (s, s - r), (s - r, s), (r, s), (0, s - r)]
+        c.create_polygon([v for pt in pts for v in pt], smooth=True, fill=p["accent"], outline="")
+        a = s * 0.30
+        c.create_polygon(s * .40, a + s * .06, s * .40, s - a - s * .06, s * .72, s / 2, fill=p["accentText"], outline="")
+
     def _build_ui(self) -> None:
-        root = self.root
+        root, sp = self.root, theme.space
         root.title(APP_TITLE)
-        root.geometry("1100x660")
-        root.minsize(900, 520)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = theme.window_size(sw, sh)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(880, 560)
 
-        style = ttk.Style()
-        _fix_tk_tag_colors(style)
-        style.configure("On.TButton", foreground="#0a7d2c")
-        style.configure("Off.TButton", foreground="#b00020")
-        style.configure("Treeview", rowheight=26)
+        self.pal = ui_style.apply(root, self.settings["theme"])
+        _fix_tk_tag_colors(ttk.Style())
+        self.icons = IconSet(tk.PhotoImage, 16)
+        self._icon_widgets: list = []
+        pal = self.pal
 
-        # top bar
-        top = ttk.Frame(root, padding=(10, 8))
-        top.pack(fill="x")
-        self.mi_btn = ttk.Button(top, width=22, command=self.toggle_multi)
+        # ---- header: logo + title | the two switches | tools
+        head = ttk.Frame(root, style="Header.TFrame", padding=(sp(5), sp(3)))
+        head.pack(fill="x")
+        self.logo = tk.Canvas(head, width=sp(8), height=sp(8), highlightthickness=0, borderwidth=0)
+        self.logo.pack(side="left")
+        self._draw_logo()
+        titles = ttk.Frame(head, style="Header.TFrame")
+        titles.pack(side="left", padx=(sp(3), sp(6)))
+        ttk.Label(titles, text="Account Manager", style="Title.TLabel").pack(anchor="w")
+        self.subtitle_var = tk.StringVar()
+        ttk.Label(titles, textvariable=self.subtitle_var, style="Status.TLabel").pack(anchor="w")
+        self.mi_btn = ttk.Button(head, width=20, command=self.toggle_multi)
         self.mi_btn.pack(side="left")
-        self.ar_btn = ttk.Button(top, width=20, command=self.toggle_all_rejoin)
-        self.ar_btn.pack(side="left", padx=6)
-        ttk.Button(top, text="Settings...", command=self.open_settings).pack(side="right")
-        ttk.Button(top, text="Schedules...", command=self.open_schedules).pack(side="right", padx=6)
-        ttk.Button(top, text="Diagnostics...", command=self.open_diagnostics).pack(side="right", padx=6)
+        ui_style.Tooltip(self.mi_btn, "Lets several Roblox clients run at once.", pal)
+        self.ar_btn = ttk.Button(head, width=18, command=self.toggle_all_rejoin)
+        self.ar_btn.pack(side="left", padx=sp(2))
+        ui_style.Tooltip(self.ar_btn, "Turn auto-rejoin on or off for every account.", pal)
+        for text, icon, cmd, tip in (
+            ("", "sliders", self.open_settings, "Settings"),
+            ("", "clock", self.open_schedules, "Schedules"),
+            ("", "pulse", self.open_diagnostics, "Diagnostics: check that everything works"),
+        ):
+            self.icon_button(head, text, icon, cmd, "Ghost.TButton", tip).pack(side="right", padx=(sp(1), 0))
+        self.theme_btn = ttk.Button(head, style="Ghost.TButton", command=self.toggle_theme, width=3)
+        self.theme_btn.pack(side="right", padx=(sp(1), 0))
+        ui_style.Tooltip(self.theme_btn, "Switch between dark and light", pal)
+        tk.Frame(root, height=1, background=pal["border"]).pack(fill="x")
         if not _is_admin():
-            ttk.Label(top, foreground="#b36b00",
-                      text="Not running as administrator - closing the singleton event may fail."
-                      ).pack(side="right", padx=10)
+            warn = ttk.Frame(root, style="Surface.TFrame", padding=(sp(5), sp(1.5)))
+            warn.pack(fill="x")
+            ttk.Label(warn, style="Warn.TLabel", text="Not running as administrator - multi-instance may not "
+                      "work. Right-click the app and choose \"Run as administrator\".").pack(anchor="w")
+            tk.Frame(root, height=1, background=pal["border"]).pack(fill="x")
 
-        body = ttk.Frame(root, padding=(10, 0))
+        # ---- body: accounts take phi parts, the side panel one part (golden split)
+        main_w, side_w = theme.split_golden(w - 2 * sp(5), gap=sp(4))
+        side_w = max(sp(70), min(side_w, sp(90)))
+        body = ttk.Frame(root, padding=(sp(5), sp(4), sp(5), 0))
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0, minsize=side_w)
         body.rowconfigure(0, weight=1)
 
-        # accounts (left)
-        left = ttk.LabelFrame(body, text="Accounts", padding=6)
-        left.grid(row=0, column=0, sticky="nsew")
+        accounts = self.card(body)
+        accounts.outer.grid(row=0, column=0, sticky="nsew", padx=(0, sp(4)))
+        bar = ttk.Frame(accounts, style="Surface.TFrame")
+        bar.pack(fill="x", pady=(0, sp(3)))
+        ttk.Label(bar, text="Accounts", style="CardHeading.TLabel").pack(side="left")
+        self.count_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self.count_var, style="CardMuted.TLabel").pack(side="left", padx=sp(2))
         self.group_filter = tk.StringVar(value=groups.ALL)
         self._group_values: tuple = ()
-        bar = ttk.Frame(left)
-        bar.pack(side="top", fill="x", pady=(0, 4))
-        ttk.Label(bar, text="Group:").pack(side="left")
-        self.group_cb = ttk.Combobox(bar, textvariable=self.group_filter, state="readonly", width=22,
+        self.group_cb = ttk.Combobox(bar, textvariable=self.group_filter, state="readonly", width=16,
                                      values=[groups.ALL])
-        self.group_cb.pack(side="left", padx=(6, 0))
+        self.group_cb.pack(side="right")
         self.group_cb.bind("<<ComboboxSelected>>", lambda e: self._render_rows())
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._render_rows())
+        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=18)
+        self.search_entry.pack(side="right", padx=sp(2))
+        search_icon = ttk.Label(bar, image=self.ico("search"), style="Card.TLabel")
+        search_icon.pack(side="right")
+        self._icon_widgets.append((search_icon, "search", "text"))
+        ui_style.Tooltip(self.search_entry, "Search by name, group or note (Ctrl+F)", pal)
 
+        tree_box = ttk.Frame(accounts, style="Surface.TFrame")
+        tree_box.pack(fill="both", expand=True)
         cols = ("group", "note", "status", "game", "rejoin", "uptime")
-        self.tree = ttk.Treeview(left, columns=cols, selectmode="extended", show="tree headings")
-        self.tree.heading("#0", text="Account")
-        self.tree.heading("group", text="Group")
-        self.tree.heading("note", text="Note")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("game", text="Last game")
-        self.tree.heading("rejoin", text="Auto-rejoin")
-        self.tree.heading("uptime", text="Uptime")
-        self.tree.column("#0", width=130, minwidth=90)
-        self.tree.column("group", width=90, minwidth=60)
-        self.tree.column("note", width=150, minwidth=60)
-        self.tree.column("status", width=130, minwidth=90)
-        self.tree.column("game", width=160, minwidth=80)
-        self.tree.column("rejoin", width=75, minwidth=60, anchor="center")
-        self.tree.column("uptime", width=65, minwidth=55, anchor="e")
-        for tag, color in (("ok", "#0a7d2c"), ("busy", "#b36b00"), ("bad", "#b00020"), ("idle", "#777777")):
-            self.tree.tag_configure(tag, foreground=color)
-        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree = ttk.Treeview(tree_box, columns=cols, selectmode="extended", show="tree headings")
+        heads = {"#0": "Account", "group": "Group", "note": "Note", "status": "Status",
+                 "game": "Last game", "rejoin": "Auto-rejoin", "uptime": "Uptime"}
+        self._col_weights = {"#0": 15, "group": 9, "note": 15, "status": 14, "game": 16, "rejoin": 8, "uptime": 7}
+        for col, text in heads.items():
+            self.tree.heading(col, text=text, anchor="w" if col not in ("rejoin", "uptime") else "center")
+            self.tree.column(col, width=sp(24), minwidth=sp(14), stretch=False,
+                             anchor="center" if col == "rejoin" else "e" if col == "uptime" else "w")
+        sb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
+        self._tree_w = 0
+        self.tree.bind("<Configure>", self._fit_columns)
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Button-3>", self.on_right_click)
         self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
+        self.tree.bind("<Return>", lambda e: self.launch_accounts(self.selected_accounts()))
+        self.tree.bind("<Delete>", lambda e: self.remove_selected())
+
+        # friendly empty state, shown over the table while there is nothing to list
+        self.empty = ttk.Frame(tree_box, style="Surface.TFrame")
+        ttk.Label(self.empty, image=self.ico("users", "text"), style="Card.TLabel").pack()
+        self._icon_widgets.append((self.empty.winfo_children()[0], "users", "text"))
+        self.empty_title = ttk.Label(self.empty, style="CardHeading.TLabel")
+        self.empty_title.pack(pady=(sp(2), 0))
+        self.empty_hint = ttk.Label(self.empty, style="CardMuted.TLabel", justify="center", wraplength=sp(80))
+        self.empty_hint.pack(pady=(sp(1), sp(3)))
+        self.empty_btn = self.icon_button(self.empty, "Add account", "plus", self.add_account, "Accent.TButton")
+        self.empty_btn.pack()
 
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label="Launch", command=lambda: self.launch_accounts(self.selected_accounts()))
@@ -402,67 +501,148 @@ class App:
         self.menu.add_command(label="Use game box as group default", command=self.set_group_default)
         self.menu.add_separator()
         self.menu.add_command(label="Remove account", command=self.remove_selected)
+        ui_style.style_menu(self.menu, pal)
 
-        # controls (right)
-        right = ttk.Frame(body, padding=(10, 0, 0, 0))
-        right.grid(row=0, column=1, sticky="ns")
+        # ---- side panel: Game, Actions, Windows, Manage (cards on the same 16 px rhythm)
+        side = ui_style.ScrollFrame(body, pal, width=side_w)
+        side.grid(row=0, column=1, sticky="nsew")
+        right = side.inner
+        gap = sp(3)
 
-        game = ttk.LabelFrame(right, text="Game", padding=8)
-        game.pack(fill="x")
+        game = self.card(right, "Game", "Pick a saved game, or paste a place ID or roblox.com link.")
+        game.outer.pack(fill="x")
         self.place_var = tk.StringVar()
-        self.place_cb = ttk.Combobox(game, textvariable=self.place_var, width=30)
+        self.place_cb = ttk.Combobox(game, textvariable=self.place_var)
         self.place_cb.pack(fill="x")
-        ttk.Label(game, text="Pick a saved game, or paste a place ID / link.",
-                  foreground="#777777", wraplength=240).pack(anchor="w", pady=(2, 6))
-        row = ttk.Frame(game)
-        row.pack(fill="x")
+        row = ttk.Frame(game, style="Surface.TFrame")
+        row.pack(fill="x", pady=(sp(2), 0))
         ttk.Button(row, text="Save game...", command=self.add_place).pack(side="left")
-        ttk.Button(row, text="Delete", command=self.remove_place).pack(side="left", padx=4)
-        ttk.Label(game, text="Server (job) ID - optional:").pack(anchor="w", pady=(10, 0))
+        ttk.Button(row, text="Delete", command=self.remove_place, style="Danger.TButton").pack(side="left", padx=sp(1))
+        ttk.Label(game, text="Server (job) ID - optional", style="CardMuted.TLabel").pack(anchor="w", pady=(sp(3), sp(1)))
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
-        ttk.Button(game, text="Find server...", command=self.open_join_dialog).pack(anchor="w", pady=(6, 0))
-        self.armed_row = ttk.Frame(game)  # shown only while a private server is armed
-        ttk.Label(self.armed_row, text="Private server armed", foreground="#a15c00").pack(side="left")
-        ttk.Button(self.armed_row, text="Clear", width=6, command=self.clear_private).pack(side="left", padx=6)
+        self.icon_button(game, "Find server...", "search", self.open_join_dialog, "Ghost.TButton",
+                         "Find a quiet server, join a friend, or use a private server").pack(anchor="w", pady=(sp(2), 0))
+        self.armed_row = ttk.Frame(game, style="Surface.TFrame")  # shown only while a private server is armed
+        ttk.Label(self.armed_row, text="Private server armed", style="Warn.TLabel").pack(side="left")
+        ttk.Button(self.armed_row, text="Clear", width=6, command=self.clear_private,
+                   style="Ghost.TButton").pack(side="left", padx=sp(2))
         self.place_var.trace_add("write", self._game_box_edited)
         self.job_var.trace_add("write", self._game_box_edited)
         self.reload_places()
 
-        act = ttk.LabelFrame(right, text="Actions", padding=8)
-        act.pack(fill="x", pady=(10, 0))
-        for text, cmd in (
-            ("Launch selected", lambda: self.launch_accounts(self.selected_accounts())),
-            ("Join all accounts", lambda: self.launch_accounts(list(self.store.accounts))),
-            ("Stop selected", self.stop_selected),
-            ("Resume selected", self.resume_selected),
-            ("Toggle auto-rejoin (selected)", self.toggle_selected_rejoin),
-        ):
-            ttk.Button(act, text=text, command=cmd).pack(fill="x", pady=2)
-        self.group_btn = ttk.Button(act, text="Launch group", command=self.launch_group, state="disabled")
-        self.group_btn.pack(fill="x", pady=2)
-        ttk.Separator(act).pack(fill="x", pady=4)
-        ttk.Button(act, text="Tile windows", command=self.tile_windows).pack(fill="x", pady=2)
-        wrow = ttk.Frame(act)
-        wrow.pack(fill="x", pady=2)
-        ttk.Button(wrow, text="Minimize all", command=self.minimize_windows).pack(side="left", expand=True, fill="x")
-        ttk.Button(wrow, text="Restore all", command=self.restore_windows).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        act = self.card(right, "Actions")
+        act.outer.pack(fill="x", pady=(gap, 0))
+        self.icon_button(act, "Launch selected", "play", lambda: self.launch_accounts(self.selected_accounts()),
+                         "Accent.TButton", "Launch the highlighted accounts (Enter)").pack(fill="x")
+        self.group_btn = self.icon_button(act, "Launch group", "users", self.launch_group, tip="Launch every account in the chosen group")
+        self.group_btn.configure(state="disabled")
+        self.group_btn.pack(fill="x", pady=(sp(1.5), 0))
+        self.icon_button(act, "Join all accounts", "grid", self.join_all).pack(fill="x", pady=(sp(1.5), 0))
+        pair = ttk.Frame(act, style="Surface.TFrame")
+        pair.pack(fill="x", pady=(sp(1.5), 0))
+        pair.columnconfigure((0, 1), weight=1, uniform="a")
+        self.icon_button(pair, "Stop", "stop", self.stop_selected, "Danger.TButton",
+                         "Stop the highlighted accounts").grid(row=0, column=0, sticky="ew", padx=(0, sp(1)))
+        self.icon_button(pair, "Resume", "refresh", self.resume_selected,
+                         tip="Restart accounts that gave up").grid(row=0, column=1, sticky="ew", padx=(sp(1), 0))
+        self.icon_button(act, "Toggle auto-rejoin", "power", self.toggle_selected_rejoin,
+                         "Ghost.TButton", "Switch auto-rejoin for the highlighted accounts").pack(fill="x", pady=(sp(1.5), 0))
 
-        acc = ttk.LabelFrame(right, text="Manage", padding=8)
-        acc.pack(fill="x", pady=(10, 0))
-        ttk.Button(acc, text="Add account...", command=self.add_account).pack(fill="x", pady=2)
-        ttk.Button(acc, text="Remove selected", command=self.remove_selected).pack(fill="x", pady=2)
+        win = self.card(right, "Windows")
+        win.outer.pack(fill="x", pady=(gap, 0))
+        self.icon_button(win, "Tile windows", "window", self.tile_windows).pack(fill="x")
+        wrow = ttk.Frame(win, style="Surface.TFrame")
+        wrow.pack(fill="x", pady=(sp(1.5), 0))
+        wrow.columnconfigure((0, 1), weight=1, uniform="w")
+        ttk.Button(wrow, text="Minimize all", command=self.minimize_windows,
+                   style="Ghost.TButton").grid(row=0, column=0, sticky="ew", padx=(0, sp(1)))
+        ttk.Button(wrow, text="Restore all", command=self.restore_windows,
+                   style="Ghost.TButton").grid(row=0, column=1, sticky="ew", padx=(sp(1), 0))
 
-        # log + status bar
-        logf = ttk.LabelFrame(root, text="Log", padding=6)
-        logf.pack(fill="both", padx=10, pady=(8, 0))
-        self.log_text = ScrolledText(logf, height=9, state="disabled", wrap="word", font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True)
-        for tag, color in (("bad", "#b00020"), ("ok", "#0a7d2c"), ("rejoin", "#1a56b0")):
-            self.log_text.tag_configure(tag, foreground=color)
+        man = self.card(right, "Manage")
+        man.outer.pack(fill="x", pady=(gap, 0))
+        self.icon_button(man, "Add account...", "plus", self.add_account, tip="Ctrl+N").pack(fill="x")
+        self.icon_button(man, "Remove selected", "trash", self.remove_selected, "Danger.TButton",
+                         "Delete").pack(fill="x", pady=(sp(1.5), 0))
 
+        # ---- log (hideable) and status bar
+        self.log_open = tk.BooleanVar(value=True)
+        logwrap = ttk.Frame(root, padding=(sp(5), sp(3), sp(5), 0))
+        logwrap.pack(fill="x")
+        logcard = self.card(logwrap)
+        logcard.outer.pack(fill="x")
+        lh = ttk.Frame(logcard, style="Surface.TFrame")
+        lh.pack(fill="x")
+        ttk.Label(lh, text="Activity", style="CardHeading.TLabel").pack(side="left")
+        self.log_toggle = ttk.Button(lh, text="Hide", style="Ghost.TButton", command=self.toggle_log, width=6)
+        self.log_toggle.pack(side="right")
+        ttk.Button(lh, text="Clear", style="Ghost.TButton", width=6, command=self.clear_log).pack(side="right")
+        self.log_box = ttk.Frame(logcard, style="Surface.TFrame")
+        self.log_box.pack(fill="x", pady=(sp(2), 0))
+        self.log_text = ScrolledText(self.log_box, height=7, state="disabled", wrap="word", font=theme.font(-1, mono=True))
+        self.log_text.pack(fill="x")
+        ui_style.style_text(self.log_text, pal)
+        self._tag_colors()
+
+        tk.Frame(root, height=1, background=pal["border"]).pack(fill="x", pady=(sp(3), 0))
+        foot = ttk.Frame(root, style="Surface.TFrame", padding=(sp(5), sp(1.5)))
+        foot.pack(fill="x")
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(root, textvariable=self.status_var, anchor="w", padding=(10, 4)).pack(fill="x")
+        ttk.Label(foot, textvariable=self.status_var, style="Status.TLabel").pack(side="left")
+        ttk.Label(foot, text="Ctrl+N add  |  Enter launch  |  Del remove  |  Ctrl+F search",
+                  style="Status.TLabel").pack(side="right")
+
+        root.bind("<Control-n>", lambda e: self.add_account())
+        root.bind("<Control-f>", lambda e: (self.search_entry.focus_set(), "break")[1])
+        self.search_entry.bind("<Escape>", lambda e: self.search_var.set(""))
+        self._set_theme_glyph()
+
+    def _fit_columns(self, event) -> None:
+        """Spreads the table's width over the columns by weight (theme.column_widths), exactly."""
+        if abs(event.width - self._tree_w) < 4:
+            return
+        self._tree_w = event.width
+        for col, width in theme.column_widths(max(0, event.width - 4), self._col_weights).items():
+            self.tree.column(col, width=width)
+
+    def _set_theme_glyph(self) -> None:
+        self.theme_btn.configure(text="\u263E" if self.settings["theme"] == "dark" else "\u2600")
+
+    def toggle_theme(self) -> None:
+        self.settings["theme"] = "light" if self.settings["theme"] == "dark" else "dark"
+        try:
+            self.settings.save()
+        except OSError as exc:
+            mi_log(f"[!] Could not save the theme: {exc!r}")
+        self.pal = ui_style.apply(self.root, self.settings["theme"])
+        _fix_tk_tag_colors(ttk.Style())
+        self.icons.clear()
+        for widget, icon, kind in self._icon_widgets:
+            try:
+                widget.configure(image=self.ico(icon, kind))
+            except tk.TclError:
+                pass
+        ui_style.style_menu(self.menu, self.pal)
+        ui_style.style_text(self.log_text, self.pal)
+        self._tag_colors()
+        self._draw_logo()
+        self._set_theme_glyph()
+        self.update_header()
+
+    def toggle_log(self) -> None:
+        if self.log_open.get():
+            self.log_box.pack_forget()
+            self.log_toggle.configure(text="Show")
+        else:
+            self.log_box.pack(fill="x", pady=(theme.space(2), 0))
+            self.log_toggle.configure(text="Hide")
+        self.log_open.set(not self.log_open.get())
+
+    def clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
 
     # ---- periodic work --------------------------------------------------
     def drain(self) -> None:
@@ -523,6 +703,9 @@ class App:
         """Redraws the account table. No timer here: refresh() schedules itself."""
         self._sync_group_filter()
         accounts = groups.filter_accounts(self.store.accounts, self.group_filter.get())
+        query = self.search_var.get().strip().lower()
+        if query:
+            accounts = [a for a in accounts if query in f"{a.username} {a.group} {a.note}".lower()]
         existing = set(self.tree.get_children())
         for iid in existing - {a.id for a in accounts}:
             self.tree.delete(iid)
@@ -540,13 +723,32 @@ class App:
             if state == "running" and started:
                 secs = int(now - started)
                 uptime = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
-            values = (a.group, a.note, label, a.lastGameName or (a.savedPlaceId or ""),
+            values = (a.group, a.note, "\u25CF  " + label, a.lastGameName or (a.savedPlaceId or ""),
                       "ON" if a.autoRejoinEnabled else "off", uptime)
+            tags = (tag, "alt") if idx % 2 else (tag,)
             if a.id in existing:
-                self.tree.item(a.id, text=a.username, values=values, tags=(tag,))
+                self.tree.item(a.id, text=a.username, values=values, tags=tags)
+                self.tree.move(a.id, "", idx)
             else:
-                self.tree.insert("", idx, iid=a.id, text=a.username, values=values, tags=(tag,))
+                self.tree.insert("", idx, iid=a.id, text=a.username, values=values, tags=tags)
+        self._update_empty_state(len(accounts))
         self.update_header()
+
+    def _update_empty_state(self, shown: int) -> None:
+        if shown:
+            self.empty.place_forget()
+            return
+        if not self.store.accounts:
+            self.empty_title.configure(text="No accounts yet")
+            self.empty_hint.configure(text="Add your first Roblox account to start. Your login is stored "
+                                           "encrypted on this computer.")
+            self.empty_btn.pack()
+        else:
+            self.empty_title.configure(text="Nothing matches")
+            self.empty_hint.configure(text="Try a different search, or choose All groups.")
+            self.empty_btn.pack_forget()
+        self.empty.place(relx=0.5, rely=0.46, anchor="center")
+        self.empty.lift()
 
     def update_header(self) -> None:
         on = self.holder.active
@@ -554,6 +756,10 @@ class App:
                               style="On.TButton" if on else "Off.TButton")
         total = len(self.store.accounts)
         n = sum(1 for a in self.store.accounts if a.autoRejoinEnabled)
+        running = sum(1 for v in self.client_snapshot().values() if v[0] == "running")
+        shown = len(self.tree.get_children())
+        self.count_var.set(f"{shown} of {total}" if shown != total else f"{total}")
+        self.subtitle_var.set(f"{running} running  |  {total} account{'s' if total != 1 else ''}")
         self.ar_btn.configure(text=f"Auto-Rejoin: {n}/{total}",
                               style="On.TButton" if total and n == total else
                               "Off.TButton" if n == 0 else "TButton")
@@ -790,9 +996,24 @@ class App:
                 self.launching.pop(a.id, None)
         self.set_status("Ready")
 
+    def join_all(self) -> None:
+        accounts = list(self.store.accounts)
+        if len(accounts) > 1 and not self.confirm(
+                "Launch every account?", f"Start {len(accounts)} Roblox clients at once? "
+                "This can use a lot of memory and CPU."):
+            return
+        self.launch_accounts(accounts)
+
     def stop_selected(self) -> None:
         accounts = self.selected_accounts()
         if not accounts:
+            return
+        snap = self.client_snapshot()
+        live = [a for a in accounts if snap.get(a.id, ("",))[0] in ("starting", "running", "rejoining", "waiting_retry")]
+        if live and not self.confirm(
+                "Stop clients?", f"Close the Roblox client for {len(live)} account(s)?\n\n"
+                + ", ".join(a.username for a in live[:8]) + (" ..." if len(live) > 8 else "")
+                + "\n\nThe game will be closed and auto-rejoin will not bring it back (use Resume)."):
             return
 
         def work() -> None:
@@ -909,6 +1130,10 @@ class App:
         if not accounts:
             return
         enable = not all(a.autoRejoinEnabled for a in accounts)
+        if not enable and not self.confirm(
+                "Turn auto-rejoin off?", f"Turn auto-rejoin off for all {len(accounts)} account(s)?\n\n"
+                "Clients that disconnect will stay disconnected."):
+            return
         for a in accounts:
             self.manager.set_enabled(a, enable)
         self.update_header()
@@ -1016,7 +1241,8 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Diagnostics")
         win.geometry("780x540")
-        text = ScrolledText(win, font=("Consolas", 9), wrap="word", state="disabled")
+        text = ScrolledText(win, font=theme.font(-1, mono=True), wrap="word", state="disabled")
+        ui_style.style_text(text, self.pal)
         text.pack(fill="both", expand=True, padx=8, pady=(8, 4))
         report = {"text": ""}
 
@@ -1072,9 +1298,24 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Settings")
         win.transient(self.root)
-        win.resizable(False, False)
-        frm = ttk.Frame(win, padding=14)
-        frm.pack()
+        win.resizable(False, True)
+        sp = theme.space
+        # Fixed footer (Save/Cancel always visible) under a tabbed body: the dialog stays short.
+        footer = ttk.Frame(win, padding=(sp(4), sp(3)))
+        footer.pack(side="bottom", fill="x")
+        tk.Frame(win, height=1, background=self.pal["border"]).pack(side="bottom", fill="x")
+        notebook = ttk.Notebook(win)
+        notebook.pack(side="top", fill="both", expand=True, padx=sp(3), pady=(sp(3), sp(2)))
+
+        cap = max(sp(60), win.winfo_screenheight() - sp(60))  # tallest a tab may ask for
+
+        def add_tab(title: str) -> ttk.Frame:
+            """Each tab scrolls on its own if the screen is too short to show it whole."""
+            tab = ui_style.ScrollFrame(notebook, self.pal, padding=sp(4), max_height=cap)
+            notebook.add(tab, text=title)
+            return tab.inner
+
+        frm = add_tab("General")
 
         spins = (
             ("rejoinCooldown", "Wait before rejoining (seconds)", 1, 120),
@@ -1095,6 +1336,7 @@ class App:
         checks = (
             ("autoEnableMultiInstance", "Turn multi-instance on when the app starts"),
             ("closeToTray", "Closing the window keeps running in the tray"),
+            ("confirmActions", "Ask before stopping clients or other disruptive actions"),
             ("restoreSessions", "On startup, re-attach to Roblox clients that are still running"),
             ("rejoinAfterCrash", "After a crash, relaunch auto-rejoin accounts that were in a game"),
         )
@@ -1105,16 +1347,16 @@ class App:
                 row=row, column=0, columnspan=2, sticky="w", pady=(10 if i == 0 else 0, 0))
             row += 1
         if not self.tray:
-            ttk.Label(frm, foreground="#777777", text="(Tray needs: pip install pystray pillow)"
+            ttk.Label(frm, style="Muted.TLabel", text="(Tray needs: pip install pystray pillow)"
                       ).grid(row=row, column=0, columnspan=2, sticky="w")
             row += 1
 
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
+        frm = add_tab("Advanced")
+        row = 0
         ttk.Label(frm, text="Advanced - Roblox object names (comma separated). Change only if a Roblox "
                             "update breaks multi-instance; Diagnostics shows the names it finds. "
                             "Switch multi-instance off and on afterwards.",
-                  foreground="#777777", wraplength=420, justify="left").grid(row=row, column=0, columnspan=2, sticky="w")
+                  style="Muted.TLabel", wraplength=420, justify="left").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         names: dict[str, tk.StringVar] = {}
         for key, label in (("mutexNames", "Mutex name(s)"), ("eventNames", "Event name(s)")):
@@ -1124,9 +1366,9 @@ class App:
             row += 1
 
         # ---- notifications
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-        ttk.Label(frm, text="Notifications", font=("Segoe UI", 10, "bold")).grid(
+        frm = add_tab("Notifications")
+        row = 0
+        ttk.Label(frm, text="Notifications", style="Heading.TLabel").grid(
             row=row, column=0, columnspan=2, sticky="w")
         row += 1
         event_vars: dict[str, tk.BooleanVar] = {}
@@ -1157,12 +1399,12 @@ class App:
         ttk.Label(frm, text="Discord webhook URL").grid(row=row, column=0, sticky="w", pady=3)
         ttk.Entry(frm, textvariable=webhook_var, show="*", width=34).grid(row=row, column=1, padx=(12, 0))
         row += 1
-        ttk.Label(frm, foreground="#777777", wraplength=420, justify="left",
+        ttk.Label(frm, style="Muted.TLabel", wraplength=420, justify="left",
                   text="Stored encrypted, never logged. A row of stars means one is saved: clear it to remove "
                        "the webhook, or paste a new URL to replace it. Create one in Discord under Server "
                        "Settings > Integrations > Webhooks.").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        test_label = ttk.Label(frm, text="", foreground="#777777")
+        test_label = ttk.Label(frm, text="", style="Muted.TLabel")
         test_label.grid(row=row, column=1, sticky="w", padx=(12, 0))
 
         def commit_notify() -> bool:
@@ -1210,9 +1452,9 @@ class App:
         row += 1
 
         # ---- layout
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-        ttk.Label(frm, text="Window layout", font=("Segoe UI", 10, "bold")).grid(
+        frm = add_tab("Layout")
+        row = 0
+        ttk.Label(frm, text="Window layout", style="Heading.TLabel").grid(
             row=row, column=0, columnspan=2, sticky="w")
         row += 1
         api = self.winapi()
@@ -1240,9 +1482,9 @@ class App:
         row += 1
 
         # ---- scheduler
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-        ttk.Label(frm, text="Scheduler", font=("Segoe UI", 10, "bold")).grid(
+        frm = add_tab("Scheduler")
+        row = 0
+        ttk.Label(frm, text="Scheduler", style="Heading.TLabel").grid(
             row=row, column=0, columnspan=2, sticky="w")
         row += 1
         sched_on_var = tk.BooleanVar(value=self.settings["schedulerEnabled"])
@@ -1255,9 +1497,9 @@ class App:
         row += 1
 
         # ---- performance (resource saver)
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-        ttk.Label(frm, text="Performance", font=("Segoe UI", 10, "bold")).grid(
+        frm = add_tab("Performance")
+        row = 0
+        ttk.Label(frm, text="Performance", style="Heading.TLabel").grid(
             row=row, column=0, columnspan=2, sticky="w")
         row += 1
         profile_var = tk.StringVar(value=self.settings["performanceProfile"]
@@ -1271,7 +1513,7 @@ class App:
         ttk.Checkbutton(frm, text="Apply the profile before every launch", variable=apply_before_var).grid(
             row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        perf_status = ttk.Label(frm, text="", foreground="#777777", wraplength=420, justify="left")
+        perf_status = ttk.Label(frm, text="", style="Muted.TLabel", wraplength=420, justify="left")
         perf_status.grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
@@ -1288,6 +1530,9 @@ class App:
             refresh_perf_status(f"{result.status}: {result.detail}. " if result.detail else "")
 
         def restore_perf() -> None:
+            if not self.confirm("Restore original?", "Put Roblox's client settings file back to how it was "
+                                "before this tool changed it?", parent=win):
+                return
             path = _perf_path()
             did = bool(path) and resourcesaver.restore(
                 settings_path=path, state_path=resourcesaver.STATE_FILE, log_fn=mi_log)
@@ -1302,7 +1547,7 @@ class App:
         perf_btns.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Button(perf_btns, text="Apply now", command=apply_perf_now).pack(side="left")
         ttk.Button(perf_btns, text="Restore original", command=restore_perf).pack(side="left", padx=6)
-        ttk.Label(frm, foreground="#777777", wraplength=420, justify="left",
+        ttk.Label(frm, style="Muted.TLabel", wraplength=420, justify="left",
                   text="Roblox reads these flags when a client starts, so running clients are not affected. "
                        "Only ClientSettings/ClientAppSettings.json in the newest Roblox version folder is "
                        "written, and the original is backed up and put back on Restore."
@@ -1355,10 +1600,17 @@ class App:
                 messagebox.showwarning("Settings", f"Applied, but could not save: {exc}", parent=win)
             win.destroy()
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(14, 0))
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(btns, text="Save", command=save).pack(side="right", padx=6)
+        ttk.Button(footer, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(footer, text="Save", command=save, style="Accent.TButton").pack(side="right", padx=sp(2))
+        # size to the tallest tab, but never taller than the screen (leave room for the taskbar)
+        win.update_idletasks()
+        sh = win.winfo_screenheight()
+        width = max(win.winfo_reqwidth(), sp(130))
+        height = min(win.winfo_reqheight(), sh - sp(30))
+        x = self.root.winfo_rootx() + sp(8)
+        y = max(0, min(self.root.winfo_rooty() + sp(8), sh - height - sp(20)))
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(width, min(height, sp(80)))
         win.grab_set()
 
 

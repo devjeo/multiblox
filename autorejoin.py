@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from account_store import DATA_DIR
+
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobloxAccountManager/0.5"
 
@@ -59,7 +61,7 @@ RETRY_DELAY_SECONDS = 30
 NEW_CLIENT_TIMEOUT = 90
 LOG_MAP_TIMEOUT = 180
 
-DEBUG_LOG = Path(__file__).with_name("rejoin_debug.log")
+DEBUG_LOG = DATA_DIR / "rejoin_debug.log"   # under %APPDATA%: a PyInstaller exe has no stable folder next to the script
 PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in game", 3: "in Studio"}
 
 
@@ -443,6 +445,7 @@ class RejoinManager(threading.Thread):
     def _dump_debug(self, c: Client, marker: str) -> None:
         """Save the log lines around a marker (long tokens redacted) so markers can be tuned."""
         try:
+            DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
             with open(DEBUG_LOG, "a", encoding="utf-8") as f:
                 f.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {c.account.username} "
                         f"marker '{marker}' ===\n")

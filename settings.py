@@ -28,6 +28,8 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULTS = {
     "autoEnableMultiInstance": True,
     "closeToTray": True,
+    "confirmActions": True,      # ask before stopping clients, bulk launches and similar
+    "theme": "dark",             # dark | light (see theme.py)
     "rejoinCooldown": 8,         # autorejoin.REJOIN_COOLDOWN_SECONDS
     "maxAttempts": 5,            # autorejoin.MAX_ATTEMPTS
     "attemptWindowMinutes": 10,  # autorejoin.ATTEMPT_WINDOW_SECONDS / 60
