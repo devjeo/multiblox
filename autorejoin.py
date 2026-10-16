@@ -60,6 +60,11 @@ ATTEMPT_WINDOW_SECONDS = 600
 RETRY_DELAY_SECONDS = 30
 NEW_CLIENT_TIMEOUT = 90
 LOG_MAP_TIMEOUT = 180
+# "Must reach this exact server" launches (joining a friend): if the account is not in that server
+# within STRICT_JOIN_SECONDS (refused, friends-only, full...), the client is closed, never retried.
+STRICT_FIRST_CHECK_SECONDS = 20
+STRICT_POLL_SECONDS = 10
+STRICT_JOIN_SECONDS = 75
 
 DEBUG_LOG = DATA_DIR / "rejoin_debug.log"   # under %APPDATA%: a PyInstaller exe has no stable folder next to the script
 PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in game", 3: "in Studio"}
@@ -190,6 +195,12 @@ class Client:
     retry_at: float = 0.0
     attempts: deque = field(default_factory=deque)
     cancelled: bool = False   # set by stop_account / a newer launch: abandon any rejoin in progress
+    # Earlier PIDs of this same client. Roblox starts a NEW RobloxPlayerBeta.exe (child of the old
+    # one) for a teleport and then closes the old one, so one account can own several PIDs over time.
+    lineage: set = field(default_factory=set, repr=False)
+    strict_job: str | None = None   # server this launch MUST reach; None = ordinary launch
+    strict_ok: bool = False         # presence has confirmed the account is in strict_job
+    strict_checked: float = 0.0
     created_utc: datetime | None = None  # process start time, used to re-attach after an app restart
     # Private-server launch data (see private_links). In memory only, hidden from repr. `private`
     # stays True for an adopted client whose code was (deliberately) not saved; such a client is
@@ -202,7 +213,7 @@ class RejoinManager(threading.Thread):
     def __init__(self, store, launch_fn, list_pids_fn, kill_fn, log_fn=print,
                  log_dir: Path | None = None, creation_fn=process_creation_utc, presence_fn=None,
                  clock=time.monotonic, sleep=time.sleep, spawn=None,
-                 notify_fn=None, on_ready_fn=None):
+                 notify_fn=None, on_ready_fn=None, family_fn=None):
         super().__init__(daemon=True)
         self.store = store
         self.launch_fn = launch_fn      # (account, place_id, job_id) -> None, raises on failure
@@ -216,6 +227,8 @@ class RejoinManager(threading.Thread):
         self.clock, self.sleep = clock, sleep
         self.notify_fn = notify_fn      # (event, account_username, detail) -> None; see _emit
         self.on_ready_fn = on_ready_fn  # (client) -> None, once a client's process is being tracked
+        self.family_fn = family_fn      # () -> {pid: parent_pid} of running game clients (optional);
+                                        # lets us follow a client that hands over to a new process
         self._spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start())
         self.clients: dict[str, Client] = {}
         self._lock = threading.RLock()
@@ -223,13 +236,16 @@ class RejoinManager(threading.Thread):
         self._stop_event = threading.Event()
 
     # ---- public API ----------------------------------------------------
-    def launch(self, account, place_id: int, job_id: str | None = None, extra: dict | None = None) -> Client:
+    def launch(self, account, place_id: int, job_id: str | None = None, extra: dict | None = None,
+               strict: bool = False) -> Client:
         """Launch an account, wait until its client appears, and start tracking it.
         `extra` is private-server launch data (see private_links); it is kept in memory for
         rejoins and never saved. Raises whatever launch_fn raises (LaunchError)."""
         with self._launch_lock:
             private = bool(extra)
             client = Client(account, place_id, None if private else job_id, extra=extra or None, private=private)
+            if strict and job_id and not private:
+                client.strict_job = job_id
             before = set(self.list_pids())
             if private:
                 self.launch_fn(account, place_id, None, extra=extra)
@@ -248,14 +264,89 @@ class RejoinManager(threading.Thread):
         account.autoRejoinEnabled = enabled
         self.store.save()
 
+    # ---- process lineage (teleports start a new client process) ----------
+    def _family(self) -> dict:
+        if not self.family_fn:
+            return {}
+        try:
+            return dict(self.family_fn())
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _descendants(roots, family: dict) -> set:
+        """PIDs in `family` whose parent chain leads to one of `roots` (roots themselves excluded)."""
+        parents, out, grew = set(roots), set(), True
+        while grew:
+            grew = False
+            for pid, ppid in family.items():
+                if ppid in parents and pid not in parents:
+                    parents.add(pid)
+                    out.add(pid)
+                    grew = True
+        return out
+
+    @staticmethod
+    def _lineage_pids(c: Client) -> set:
+        return {p for p in ({c.pid} | c.lineage) if p}
+
+    def _follow_successor(self, c: Client) -> bool:
+        """If Roblox handed this client over to a new process (teleport), track the new PID.
+        Without this the old PID's exit looks like a disconnect (spurious rejoin) and Stop
+        would kill only the dead PID, leaving the new client running."""
+        family = self._family()
+        if not family or not c.pid:
+            return False
+        mine = self._lineage_pids(c)
+        with self._lock:
+            claimed = {p for x in self.clients.values() if x is not c for p in self._lineage_pids(x)}
+        kids = sorted(p for p, parent in family.items() if parent in mine and p not in mine and p not in claimed)
+        if not kids:
+            return False
+        old, c.pid = c.pid, kids[0]
+        c.lineage.add(old)
+        c.log_path, c.log_offset = None, 0     # the new process writes a new log file
+        c.marker_at, c.misses = None, 0
+        c.started = c.last_presence = self.clock()   # fresh grace period while it loads
+        try:
+            c.created_utc = self.creation_fn(c.pid)
+        except Exception:
+            c.created_utc = None
+        self.log(f"[rejoin] {c.account.username}: client moved from PID {old} to PID {c.pid} "
+                 "(Roblox started a new process, e.g. a teleport)")
+        return True
+
+    def _kill_lineage(self, c: Client) -> bool:
+        """Close the client's current process AND any processes it handed over to. Returns True
+        if something was closed. Logs loudly if a process survives (usually: Roblox runs as
+        administrator but this app does not, so taskkill is refused)."""
+        roots = self._lineage_pids(c)
+        killed = False
+        for _ in range(6):
+            alive = set(self.list_pids())
+            targets = (roots & alive) | (self._descendants(roots, self._family()) & alive)
+            if not targets:
+                break
+            for pid in sorted(targets):
+                self.kill_fn(pid)
+                killed = True
+            roots |= targets
+            if not self.family_fn:       # no lineage info: one pass, as before
+                break
+            self.sleep(0.5)              # a successor may be starting right now; look again
+        survivors = roots & set(self.list_pids())
+        if survivors and killed:
+            self.log(f"[!] {c.account.username}: could not close PID {', '.join(map(str, sorted(survivors)))}. "
+                     "If Roblox runs as administrator, run this app as administrator too.")
+        return killed
+
     def stop_account(self, account) -> bool:
         """Close an account's client on purpose (no auto-rejoin)."""
         with self._lock:
             client = self.clients.pop(account.id, None)
         if client:
             client.cancelled = True  # a rejoin already in progress checks this and backs out
-        if client and client.pid and client.pid in set(self.list_pids()):
-            self.kill_fn(client.pid)
+        if client and self._kill_lineage(client):
             self.log(f"[rejoin] {account.username}: stopped on request (PID {client.pid})")
             return True
         return False
@@ -367,10 +458,14 @@ class RejoinManager(threading.Thread):
 
     # ---- detection ------------------------------------------------------
     def _check_running(self, c: Client, now: float, alive: set) -> None:
+        if self._follow_successor(c):
+            alive = alive | {c.pid}      # the new process is running (it came from a fresh snapshot)
         if c.pid not in alive:
             self._on_disconnect(c, "client process exited")
             return
         uptime = now - c.started
+        if self._check_strict(c, now, uptime):
+            return
         self._poll_log(c, now, uptime)
 
         if c.marker_at is not None and now - c.marker_at >= MARKER_DEBOUNCE_SECONDS:
@@ -388,6 +483,33 @@ class RejoinManager(threading.Thread):
         if now - c.last_presence >= PRESENCE_POLL_SECONDS:
             c.last_presence = now
             self._poll_presence(c, uptime)
+
+    def _check_strict(self, c: Client, now: float, uptime: float) -> bool:
+        """For a launch that must land in one specific server (friend join). Confirms it through
+        presence; if the account is not there in time, closes the client for good. Returns True
+        if it closed it."""
+        if not c.strict_job or c.strict_ok:
+            return False
+        if uptime >= STRICT_FIRST_CHECK_SECONDS and now - c.strict_checked >= STRICT_POLL_SECONDS:
+            c.strict_checked = now
+            p = self.presence_fn(c.account)
+            if p and p.get("userPresenceType") == 2 and p.get("gameId") == c.strict_job:
+                c.strict_ok = True
+                return False
+        if uptime < STRICT_JOIN_SECONDS:
+            return False
+        self._abandon_strict(c, f"did not get into the requested server within {STRICT_JOIN_SECONDS}s "
+                                "(Roblox refused the join, it is friends-only, or the server is full)")
+        return True
+
+    def _abandon_strict(self, c: Client, reason: str) -> None:
+        with self._lock:
+            if self.clients.get(c.account.id) is c:
+                del self.clients[c.account.id]
+        c.cancelled = True            # no rejoin, no disconnect alert
+        self._kill_lineage(c)
+        self.log(f"[join] {c.account.username}: {reason}; closed it.")
+        self._emit("rejoin_gaveup", c, reason)
 
     def _poll_presence(self, c: Client, uptime: float) -> None:
         p = self.presence_fn(c.account)
@@ -475,6 +597,9 @@ class RejoinManager(threading.Thread):
     def _on_disconnect(self, c: Client, reason: str) -> None:
         if c.cancelled:  # stopped on purpose a moment ago: that is not a disconnect
             return
+        if c.strict_job and not c.strict_ok:   # never reached the requested server: do not retry elsewhere
+            self._abandon_strict(c, f"closed before reaching the requested server ({reason})")
+            return
         self.log(f"[rejoin] {c.account.username}: disconnect detected - {reason}")
         self._emit("disconnect", c, reason + ("" if c.account.autoRejoinEnabled else " (auto-rejoin is off)"))
         if not c.account.autoRejoinEnabled:
@@ -510,10 +635,9 @@ class RejoinManager(threading.Thread):
             c.attempts.append(now)
             n = len(c.attempts)
 
-            if c.pid and c.pid in set(self.list_pids()):
-                self.kill_fn(c.pid)
+            if self._kill_lineage(c):
                 for _ in range(20):
-                    if c.pid not in set(self.list_pids()):
+                    if not (self._lineage_pids(c) & set(self.list_pids())):
                         break
                     self.sleep(0.5)
 
@@ -551,8 +675,9 @@ class RejoinManager(threading.Thread):
         deadline = self.clock() + NEW_CLIENT_TIMEOUT
         while self.clock() < deadline and not self._stop_event.is_set():
             with self._lock:
-                claimed = {x.pid for x in self.clients.values() if x.pid and x is not c}
-            new = sorted(set(self.list_pids()) - before - claimed)
+                claimed = {p for x in self.clients.values() if x is not c for p in self._lineage_pids(x)}
+            handed_over = self._descendants(claimed, self._family())   # another account's teleport, not our launch
+            new = sorted(set(self.list_pids()) - before - claimed - handed_over)
             if new:
                 if c.cancelled:  # Stop was pressed while this client was starting
                     self.kill_fn(new[0])

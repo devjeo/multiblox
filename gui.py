@@ -58,17 +58,19 @@ import ui_style
 from icons import IconSet
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
-from launcher import LaunchError, _running_pids, kill_pid, launch_account
+from launcher import LaunchError, _running_family, _running_pids, kill_pid, launch_account
 from multi_instance import (
     ProcessWatcher,
     SingletonHolder,
     find_roblox_processes,
+    kill_roblox_processes,
     log as mi_log,
     make_event_closer,
 )
 from notifier import EVENT_LABELS, Notifier
 from notify_discord import DiscordChannel
 from notify_tray import TrayChannel
+from game_picker import GamePicker
 from places import PlaceStore, fetch_place_name, parse_place_input
 from sessions import SessionStore, restore as restore_sessions
 from settings import DEFAULTS, Settings
@@ -153,6 +155,7 @@ class App:
         self.places = PlaceStore()
         self.launching: dict[str, str] = {}  # account id -> "Queued..." / "Launching..."
         self.tray = None
+        self._lock_id = None   # account id the list is locked to while Join user is open
         self._closing = False
         self._winapi = None            # built on first use (window layout)
         self._autotiler = None
@@ -176,6 +179,7 @@ class App:
             launch_fn=self._launch_fn,
             list_pids_fn=_running_pids,
             kill_fn=kill_pid,
+            family_fn=_running_family,
             log_fn=mi_log,
             notify_fn=lambda event, account, detail: self.notifier.notify(event, account, detail),
             on_ready_fn=self._on_client_ready,
@@ -323,6 +327,25 @@ class App:
         if not self.settings["confirmActions"]:
             return True
         return messagebox.askyesno(title, message, icon="warning", default="no", parent=parent or self.root)
+
+    def lock_selection(self, account) -> None:
+        """Keep the account list on exactly this account (Join user works with one account)."""
+        self._lock_id = account.id
+        try:
+            self.tree.selection_set(account.id)
+        except tk.TclError:
+            pass
+
+    def unlock_selection(self) -> None:
+        self._lock_id = None
+
+    def _enforce_lock(self) -> None:
+        lock = getattr(self, "_lock_id", None)
+        if lock and set(self.tree.selection()) != {lock}:
+            try:
+                self.tree.selection_set(lock)
+            except tk.TclError:
+                pass
 
     def selected_accounts(self) -> list:
         chosen = set(self.tree.selection())
@@ -478,6 +501,7 @@ class App:
         self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
         self.tree.bind("<Return>", lambda e: self.launch_accounts(self.selected_accounts()))
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._enforce_lock(), add="+")
 
         # friendly empty state, shown over the table while there is nothing to list
         self.empty = ttk.Frame(tree_box, style="Surface.TFrame")
@@ -509,11 +533,14 @@ class App:
         right = side.inner
         gap = sp(3)
 
-        game = self.card(right, "Game", "Pick a saved game, or paste a place ID or roblox.com link.")
+        game = self.card(right, "Game", "Pick a saved game, paste a place ID or roblox.com link, or type a name and press Search.")
         game.outer.pack(fill="x")
         self.place_var = tk.StringVar()
-        self.place_cb = ttk.Combobox(game, textvariable=self.place_var)
-        self.place_cb.pack(fill="x")
+        self.game_picker = GamePicker(
+            game, self, self.place_var, style="Surface.TFrame",
+            on_saved=lambda p: mi_log(f"[ok] Saved game: {p.name} (place {p.placeId})"))
+        self.game_picker.pack(fill="x")
+        self.place_cb = self.game_picker.combobox
         row = ttk.Frame(game, style="Surface.TFrame")
         row.pack(fill="x", pady=(sp(2), 0))
         ttk.Button(row, text="Save game...", command=self.add_place).pack(side="left")
@@ -522,7 +549,7 @@ class App:
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
         self.icon_button(game, "Find server...", "search", self.open_join_dialog, "Ghost.TButton",
-                         "Find a quiet server, join a friend, or use a private server").pack(anchor="w", pady=(sp(2), 0))
+                         "Find a quiet server, join a user, or use a private server").pack(anchor="w", pady=(sp(2), 0))
         self.armed_row = ttk.Frame(game, style="Surface.TFrame")  # shown only while a private server is armed
         ttk.Label(self.armed_row, text="Private server armed", style="Warn.TLabel").pack(side="left")
         ttk.Button(self.armed_row, text="Clear", width=6, command=self.clear_private,
@@ -548,6 +575,8 @@ class App:
                          tip="Restart accounts that gave up").grid(row=0, column=1, sticky="ew", padx=(sp(1), 0))
         self.icon_button(act, "Toggle auto-rejoin", "power", self.toggle_selected_rejoin,
                          "Ghost.TButton", "Switch auto-rejoin for the highlighted accounts").pack(fill="x", pady=(sp(1.5), 0))
+        self.icon_button(act, "Stop ALL Roblox", "stop", self.stop_all_roblox, "Danger.TButton",
+                         "Close every Roblox client on this PC, even ones this tool lost track of").pack(fill="x", pady=(sp(1.5), 0))
 
         win = self.card(right, "Windows")
         win.outer.pack(fill="x", pady=(gap, 0))
@@ -909,7 +938,7 @@ class App:
             return saved.placeId
         place_id, _ = parse_place_input(raw)
         if place_id is None:
-            messagebox.showwarning("Unknown game", "That is not a saved game, a place ID, or a roblox.com game link.")
+            self.game_picker.search()  # plain text: look the game up online instead of refusing it
         return place_id
 
     # ---- private server (experimental) ----------------------------------
@@ -937,8 +966,10 @@ class App:
             self.clear_private()  # changing the game or server means "not that private server any more"
 
     def launch_accounts(self, accounts: list, place_id: int | None = None,
-                        job_id: str | None = None) -> None:
-        """`place_id` / `job_id` override the Game box (Launch group passes a saved default)."""
+                        job_id: str | None = None, strict: bool = False) -> None:
+        """`place_id` / `job_id` override the Game box (Launch group passes a saved default).
+        `strict`: the accounts MUST end up in `job_id`; any that do not get in are closed, not retried
+        (used by Join user)."""
         if not accounts:
             messagebox.showinfo("Launch", "Select one or more accounts first.")
             return
@@ -978,15 +1009,16 @@ class App:
 
         for a in todo:
             self.launching[a.id] = "Queued..."
-        self.run_bg(self._launch_worker, todo, place_id, job_id, extra)
+        self.run_bg(self._launch_worker, todo, place_id, job_id, extra, strict)
 
-    def _launch_worker(self, accounts: list, place_id: int, job_id: str | None, extra: dict | None = None) -> None:
+    def _launch_worker(self, accounts: list, place_id: int, job_id: str | None, extra: dict | None = None,
+                       strict: bool = False) -> None:
         total = len(accounts)
         for n, a in enumerate(accounts, 1):
             self.launching[a.id] = "Launching..."
             self.set_status(f"Launching {a.username} ({n}/{total})...")
             try:
-                self.manager.launch(a, place_id, job_id, extra=extra)  # waits for the client + settle pause
+                self.manager.launch(a, place_id, job_id, extra=extra, strict=strict)  # waits for the client + settle pause
                 mi_log(f"[ok] {a.username} is running.")
             except LaunchError as exc:
                 mi_log(f"[!] {a.username}: {exc}")
@@ -1020,6 +1052,27 @@ class App:
             for a in accounts:
                 if not self.manager.stop_account(a):
                     mi_log(f"[!] {a.username} has no running client.")
+        self.run_bg(work)
+
+    def stop_all_roblox(self) -> None:
+        """Close EVERY Roblox game client on the PC, tracked or not (strays, teleport leftovers)."""
+        running = find_roblox_processes()
+        if not running:
+            messagebox.showinfo(APP_TITLE, "No Roblox clients are running.")
+            return
+        if not self.confirm(
+                "Stop ALL Roblox?", f"Close all {len(running)} Roblox client(s) on this PC, including any this "
+                "tool did not start?\n\nAuto-rejoin will not bring them back."):
+            return
+
+        def work() -> None:
+            for a in list(self.store.accounts):
+                self.manager.stop_account(a)   # marks them intentional so nothing is rejoined
+            if kill_roblox_processes():
+                mi_log("[ok] All Roblox clients closed.")
+            else:
+                mi_log("[!] Some Roblox processes could not be closed. If Roblox runs as administrator, "
+                       "run this app as administrator.")
         self.run_bg(work)
 
     def resume_selected(self) -> None:
@@ -1161,9 +1214,11 @@ class App:
                 verb = "Updated cookie for" if updated else "Added"
                 mi_log(f"[ok] {verb} {account.username} (userId {account.userId}). Cookie stored encrypted.")
             except CookieError as exc:
-                self.ui(lambda: messagebox.showerror("Could not add account", str(exc)))
+                msg = str(exc)   # `exc` is deleted when the except block ends, before the UI callback runs
+                self.ui(lambda: messagebox.showerror("Could not add account", msg))
             except OSError as exc:
-                self.ui(lambda: messagebox.showerror("Could not encrypt/save", str(exc)))
+                msg = str(exc)
+                self.ui(lambda: messagebox.showerror("Could not encrypt/save", msg))
             finally:
                 self.set_status("Ready")
         self.run_bg(work)

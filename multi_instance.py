@@ -171,17 +171,22 @@ def find_roblox_processes() -> list[tuple[int, str]]:
 def kill_roblox_processes() -> bool:
     """Force-closes every Roblox client (and its child processes).
     Returns True if none remain afterwards."""
-    for pid, _name in find_roblox_processes():
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    for _ in range(20):
-        if not find_roblox_processes():
+    # Several rounds: a client that is mid-teleport can start a new process while we kill the old one.
+    for _round in range(5):
+        procs = find_roblox_processes()
+        if not procs:
             return True
-        time.sleep(0.25)
+        for pid, _name in procs:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        for _ in range(12):
+            if not find_roblox_processes():
+                break
+            time.sleep(0.25)
     return not find_roblox_processes()
 
 

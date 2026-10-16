@@ -46,7 +46,7 @@ Written in pure Python with no third-party dependencies required (the system tra
 **Join tools** (Game box, **Find server...**)
 - Server finder: pick the emptiest, fullest, "best" (fullest that is not full) or a minimum-player server and drop its job ID into the Game box.
 - Friend join: look up a friend by username or ID and join their server (shows "unavailable" when their privacy settings hide it).
-- Private servers (experimental): paste a private-server or share link. The code is kept in memory only, so after a crash the client is re-attached but not relaunched.
+- Private servers (experimental): pick a game and choose one of your own or your friends' private servers. The code is kept in memory only, so after a crash the client is re-attached but not relaunched.
 
 **Resource saver**
 - Normal, Low and Minimum profiles write client flags (currently an FPS cap) before each launch. The original `ClientAppSettings.json` is backed up once and **Restore original** puts back the exact bytes (or deletes the file if there was none).

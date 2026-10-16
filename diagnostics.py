@@ -436,6 +436,7 @@ def check_join_tools(include_network: bool = True):
     results of the last finder run and the last friend lookup."""
     import friends
     import private_links
+    import private_servers
     import server_finder
     results = []
     if include_network:
@@ -482,6 +483,12 @@ def check_join_tools(include_network: bool = True):
     if private:
         results.append(_info("Private server (experimental)",
                              f"last action ({private['at']}): {private['event']}, place {private['placeId']}"))
+    listing = dict(private_servers.last_result)  # shown only after a Load in the Private server tab
+    if listing.get("error"):
+        results.append(_warn("Private server list", f"last load ({listing['at']}): {listing['error']}"))
+    elif listing:
+        results.append(_info("Private server list",
+                             f"last load ({listing['at']}): place {listing['placeId']}, {listing['count']} servers"))
     return results
 
 

@@ -292,6 +292,104 @@ class RejoinTests(unittest.TestCase):
         mgr.launch(a, 111, None)
         self.assertTrue(old.cancelled)
 
+    # ---- teleports: Roblox starts a NEW client process (child of the old one) ----
+    def _family_manager(self, accounts):
+        parents = {}   # pid -> parent pid; anything not listed was started by the app (parent 999)
+        mgr, _ = make_manager(self.world, accounts,
+                              family_fn=lambda: {p: parents.get(p, 999) for p in self.world.pids})
+        return mgr, parents
+
+    def _teleport(self, parents, old, keep_old=True):
+        new = self.world.next_pid
+        self.world.next_pid += 1
+        self.world.pids.add(new)
+        parents[new] = old
+        if not keep_old:
+            self.world.pids.discard(old)
+        return new
+
+    def test_teleport_is_followed_without_a_spurious_rejoin(self):
+        [a] = accounts = make_accounts(1)
+        mgr, parents = self._family_manager(accounts)
+        mgr.launch(a, 111, None)
+        old = mgr.clients[a.id].pid
+        new = self._teleport(parents, old, keep_old=False)   # old closes, new carries on
+        tick_for(mgr, self.world, 3)
+        self.assertEqual(len(self.world.launches), 1, "a teleport is not a disconnect")
+        self.assertEqual(mgr.clients[a.id].pid, new)
+        self.assertEqual(mgr.clients[a.id].state, "running")
+
+    def test_stop_closes_the_teleport_successor_too(self):
+        [a] = accounts = make_accounts(1)
+        mgr, parents = self._family_manager(accounts)
+        mgr.launch(a, 111, None)
+        old = mgr.clients[a.id].pid
+        new = self._teleport(parents, old)                   # Stop lands while both exist
+        grand = self._teleport(parents, new)
+        self.assertTrue(mgr.stop_account(a))
+        self.assertEqual(self.world.pids, set(), "no successor may be left running")
+        self.assertEqual(set(self.world.kills), {old, new, grand})
+
+    def test_stop_finds_a_successor_whose_parent_already_exited(self):
+        [a] = accounts = make_accounts(1)
+        mgr, parents = self._family_manager(accounts)
+        mgr.launch(a, 111, None)
+        old = mgr.clients[a.id].pid
+        self._teleport(parents, old, keep_old=False)         # tracker has not ticked yet
+        self.assertTrue(mgr.stop_account(a))
+        self.assertEqual(self.world.pids, set())
+
+    def test_other_accounts_launch_does_not_claim_a_teleport_successor(self):
+        a, b = accounts = make_accounts(2)
+        mgr, parents = self._family_manager(accounts)
+        mgr.launch(a, 111, None)
+        pid_a = mgr.clients[a.id].pid
+        orig = self.world.launch
+
+        def launch_during_teleport(account, place, job):
+            self._teleport(parents, pid_a)                   # a's client teleports mid-launch of b
+            orig(account, place, job)
+        mgr.launch_fn = launch_during_teleport
+        mgr.launch(b, 111, None)
+        self.assertNotEqual(mgr.clients[b.id].pid, mgr.clients[a.id].pid)
+        self.assertEqual(self.world.owner[mgr.clients[b.id].pid], b.id)
+
+    # ---- strict joins (Join friend): reach THAT server or get closed, never retried elsewhere ----
+    def test_strict_join_that_never_arrives_is_closed_not_retried(self):
+        [a] = accounts = make_accounts(1)               # auto-rejoin ON: must still not retry
+        mgr, _ = make_manager(self.world, accounts)
+        mgr.launch(a, 111, "friendJOB12345", strict=True)   # presence says "in game", but another server
+        tick_for(mgr, self.world, autorejoin.STRICT_JOIN_SECONDS + 15)
+        self.assertEqual(self.world.pids, set(), "the client must be closed")
+        self.assertEqual(len(self.world.launches), 1, "no retry into any server")
+        self.assertNotIn(a.id, mgr.clients)
+
+    def test_strict_join_that_arrives_keeps_running(self):
+        [a] = accounts = make_accounts(1)
+        mgr, _ = make_manager(self.world, accounts)
+        mgr.launch(a, 111, "friendJOB12345", strict=True)
+        self.world.presence[a.id]["gameId"] = "friendJOB12345"
+        tick_for(mgr, self.world, autorejoin.STRICT_JOIN_SECONDS + 60)
+        self.assertEqual(len(self.world.pids), 1)
+        self.assertTrue(mgr.clients[a.id].strict_ok)
+        self.assertEqual(mgr.clients[a.id].state, "running")
+
+    def test_strict_join_whose_client_exits_early_is_not_rejoined(self):
+        [a] = accounts = make_accounts(1)
+        mgr, _ = make_manager(self.world, accounts)
+        mgr.launch(a, 111, "friendJOB12345", strict=True)
+        self.world.crash(a)
+        tick_for(mgr, self.world, 5)
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertNotIn(a.id, mgr.clients)
+
+    def test_ordinary_launch_is_unaffected_by_strict_logic(self):
+        [a] = accounts = make_accounts(1)
+        mgr, _ = make_manager(self.world, accounts)
+        mgr.launch(a, 111, "friendJOB12345")             # not strict
+        tick_for(mgr, self.world, autorejoin.STRICT_JOIN_SECONDS + 15)
+        self.assertEqual(len(self.world.pids), 1)
+
     # ---- restart recovery -------------------------------------------
     def test_session_records_only_include_live_trackers(self):
         accounts = make_accounts(2)

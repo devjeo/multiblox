@@ -312,6 +312,13 @@ def _running_pids() -> set[int]:
     return {pid for pid, _ in find_roblox_processes()}
 
 
+def _running_family() -> dict[int, int]:
+    """{pid: parent_pid} of running Roblox game clients. A teleport starts a new client process
+    whose parent is the old one; auto-rejoin uses this to keep following the account."""
+    from multi_instance import ROBLOX_PROCESS_NAMES, list_processes
+    return {pid: ppid for pid, ppid, _ in list_processes(ROBLOX_PROCESS_NAMES)}
+
+
 def parse_selection(store: AccountStore, raw: str) -> tuple[list[Account], list[str]]:
     """Turns '1,3', 'alice,bob', 'all' or 'group:farm' (mix them with commas) into
     (accounts, problems). Pure: it prints nothing, so it can be tested."""
@@ -447,12 +454,15 @@ def cmd_status(manager: RejoinManager) -> None:
             print(line)
 
 
-def kill_pid(pid: int) -> None:
-    subprocess.run(
+def kill_pid(pid: int) -> bool:
+    """Force-closes a process tree. True if taskkill reported success (it fails with 'access denied'
+    when the target runs as administrator and this app does not)."""
+    result = subprocess.run(
         ["taskkill", "/PID", str(pid), "/T", "/F"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
+    return result.returncode == 0
 
 
 def main() -> None:
@@ -480,6 +490,7 @@ def main() -> None:
         list_pids_fn=_running_pids,
         kill_fn=kill_pid,
         log_fn=mi_log,
+        family_fn=_running_family,
     )
     manager.start()
 

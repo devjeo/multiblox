@@ -4,6 +4,7 @@ Friend join (Feature C2): look a user up, see which server they are in, join it.
   find_user(query)            username, user ID, @name or a roblox.com/users/<id> link -> User
   get_presence(cookie, id)    one user's presence; needs a logged-in account (the cookie)
   resolve_join_target(p)      (placeId, jobId) when the user is in a game AND Roblox shows where
+  online_friends(cookie, id)  the account's friends that are online right now, joinable ones first
 
 Pure logic: no Tk, no Windows. The network call is the `fetch` parameter (default
 net.request), so tests pass a fake. Joining itself uses the existing job-ID launch path.
@@ -27,6 +28,8 @@ import net
 USER_BY_ID_URL = "https://users.roblox.com/v1/users/{user_id}"
 USERNAMES_URL = "https://users.roblox.com/v1/usernames/users"
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+FRIENDS_URL = "https://friends.roblox.com/v1/users/{user_id}/friends"
+PRESENCE_BATCH = 50  # user IDs per presence request
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 PROFILE_LINK_RE = re.compile(r"roblox\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?users/(\d{1,15})", re.IGNORECASE)
@@ -136,6 +139,67 @@ def get_presence(cookie: str, user_id: int, *, fetch=net.request) -> Presence | 
         raise ValueError("user_id must be a positive integer")
     resp = fetch("POST", PRESENCE_URL, json_body={"userIds": [user_id]}, cookie=cookie)
     return parse_presence(resp.json(), user_id)
+
+
+def list_friends(user_id: int, *, fetch=net.request) -> list[User]:
+    """The friends of `user_id` (a friends list is public, so no cookie is needed).
+    Raises net.HttpError on failure."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("This account has no Roblox user ID saved. Re-add the account.")
+    payload = fetch("GET", FRIENDS_URL.format(user_id=user_id)).json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    users = [u for u in (parse_user(item) for item in data or []) if u is not None]
+    return users
+
+
+def get_presences(cookie: str, user_ids: list[int], *, fetch=net.request) -> dict[int, Presence]:
+    """Presence of many users at once, as seen by the account that owns `cookie`."""
+    found: dict[int, Presence] = {}
+    for i in range(0, len(user_ids), PRESENCE_BATCH):
+        chunk = list(user_ids[i:i + PRESENCE_BATCH])
+        payload = fetch("POST", PRESENCE_URL, json_body={"userIds": chunk}, cookie=cookie).json()
+        for uid in chunk:
+            p = parse_presence(payload, uid)
+            if p is not None:
+                found[uid] = p
+    return found
+
+
+@dataclass(frozen=True)
+class FriendEntry:
+    user: User
+    presence: Presence
+
+    @property
+    def joinable(self) -> bool:
+        return resolve_join_target(self.presence) is not None
+
+    @property
+    def title(self) -> str:
+        u = self.user
+        return u.name if not u.display_name or u.display_name == u.name else f"{u.display_name} (@{u.name})"
+
+    @property
+    def status(self) -> str:
+        p = self.presence
+        if p.state == 2:
+            return "In a game - joinable" if self.joinable else "In a game - server hidden"
+        return PRESENCE_NAMES.get(p.state, "unknown")
+
+
+def _sort_key(entry: FriendEntry):
+    p = entry.presence
+    rank = 0 if entry.joinable else 1 if p.state == 2 else 2 if p.state == 1 else 3
+    return rank, entry.title.lower()
+
+
+def online_friends(cookie: str, user_id: int, *, fetch=net.request) -> list[FriendEntry]:
+    """Friends of the account that are online (in a game, online, or in Studio), joinable first."""
+    users = list_friends(user_id, fetch=fetch)
+    presences = get_presences(cookie, [u.id for u in users], fetch=fetch) if users else {}
+    entries = [FriendEntry(u, presences[u.id]) for u in users
+               if u.id in presences and presences[u.id].state != 0]
+    return sorted(entries, key=_sort_key)
 
 
 def resolve_join_target(presence: Presence | None) -> tuple[int, str] | None:

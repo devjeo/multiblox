@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The lists in Server finder, Join friend, Private server and the game search were created before the frame that holds them and then packed into it, which put them under that frame in Tk's stacking order and made them invisible. They are now drawn on top.
+
+### Changed
+- **Game picker.** The Game box in the main window and the Private server tab now share one picker: type or pick a saved game, paste a place ID or roblox.com link, or type a name and press Search (or Enter) to look the game up on Roblox. Results show the game's picture, players, rating and creator; picking one fills the box and, by default, saves it to your games (a game you already saved keeps your name). Emoji in game names are dropped so they cannot break Tk. New `game_search.py` and `game_picker.py`.
+- **Private server tab** (Find server...): pick a game (saved game, place ID or link), press Load, and see the private servers of the selected account and of its friends, with a Mine / Friends filter. Select one and press Arm. There is no paste-a-launch-link box any more: nothing needs to be copied from the browser. New `private_servers.py`; Diagnostics shows the last load.
+
 ## 2.0.0 - 2026-10-16
 
 ### Added
