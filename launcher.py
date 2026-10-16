@@ -54,11 +54,14 @@ PLACE_DETAILS_URL = "https://games.roblox.com/v1/games/multiget-place-details?pl
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobloxAccountManager/0.3"
 
 class LaunchError(Exception):
-    """`fatal` means retrying won't help (e.g. the cookie was rejected)."""
+    """`fatal` means retrying won't help (e.g. the cookie was rejected).
+    `reason` says why, for code that reacts differently: 'cookie_rejected',
+    'cannot_decrypt', 'rate_limited' or 'other'."""
 
-    def __init__(self, message: str, fatal: bool = False):
+    def __init__(self, message: str, fatal: bool = False, reason: str = "other"):
         super().__init__(message)
         self.fatal = fatal
+        self.reason = reason
 
 
 # --------------------------------------------------------------------------
@@ -92,9 +95,11 @@ def request_auth_ticket(cookie: str) -> str:
                     "Roblox rejected this account's cookie (expired or logged out). "
                     "Re-add the account in account_store.py.",
                     fatal=True,
+                    reason="cookie_rejected",
                 ) from None
             if exc.code == 429:
-                raise LaunchError("Roblox is rate-limiting requests. Wait a minute and try again.") from None
+                raise LaunchError("Roblox is rate-limiting requests. Wait a minute and try again.",
+                                  reason="rate_limited") from None
             raise LaunchError(f"Roblox returned HTTP {exc.code} for the auth ticket.") from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise LaunchError(f"Could not reach Roblox: {exc}") from None
@@ -153,7 +158,8 @@ def launch_account(store: AccountStore, account: Account, place_id: int, job_id:
         cookie = store.get_cookie(account)
     except OSError as exc:
         raise LaunchError(
-            f"Could not decrypt the cookie (different Windows user or PC?): {exc}", fatal=True
+            f"Could not decrypt the cookie (different Windows user or PC?): {exc}", fatal=True,
+            reason="cannot_decrypt",
         ) from None
     try:
         game_name = fetch_game_name(cookie, place_id)

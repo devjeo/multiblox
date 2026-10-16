@@ -34,6 +34,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -45,6 +46,8 @@ import autorejoin
 import diagnostics
 import groups
 import multi_instance
+import notify_discord
+import secrets_store
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
 from launcher import LaunchError, _running_pids, kill_pid, launch_account
@@ -55,6 +58,9 @@ from multi_instance import (
     log as mi_log,
     make_event_closer,
 )
+from notifier import EVENT_LABELS, Notifier
+from notify_discord import DiscordChannel
+from notify_tray import TrayChannel
 from places import PlaceStore, fetch_place_name, parse_place_input
 from sessions import SessionStore, restore as restore_sessions
 from settings import DEFAULTS, Settings
@@ -141,6 +147,14 @@ class App:
         self.tray = None
         self._closing = False
 
+        # Notifications. Built BEFORE the rejoin manager, which reports events to it. The tray
+        # channel looks the icon up lazily because the tray is created later.
+        self.notifier = Notifier(
+            clock=time.monotonic, channels=self._notify_channels(),
+            events=self.settings["notifyEvents"], cooldown_sec=self.settings["notifyCooldownSeconds"],
+            log_fn=mi_log)
+        self.notifier.start()
+
         # ---- backend (same wiring as launcher.main)
         self.holder = SingletonHolder()
         self.watcher = ProcessWatcher(
@@ -152,6 +166,7 @@ class App:
             list_pids_fn=_running_pids,
             kill_fn=kill_pid,
             log_fn=mi_log,
+            notify_fn=lambda event, account, detail: self.notifier.notify(event, account, detail),
         )
         self.manager.start()
 
@@ -186,6 +201,19 @@ class App:
         with self.manager._lock:
             return {aid: (c.state, c.pid, c.started, len(c.attempts))
                     for aid, c in self.manager.clients.items()}
+
+    def _notify_channels(self) -> dict:
+        """The channels the current settings turn on (the Discord URL is read at send time)."""
+        channels: dict = {}
+        if self.settings["notifyDiscord"]:
+            channels["discord"] = DiscordChannel()
+        if self.settings["notifyTray"]:
+            channels["tray"] = TrayChannel(icon_fn=lambda: self.tray)
+        return channels
+
+    def apply_notify_settings(self) -> None:
+        self.notifier.reconfigure(self._notify_channels(), self.settings["notifyEvents"],
+                                  self.settings["notifyCooldownSeconds"])
 
     def selected_accounts(self) -> list:
         chosen = set(self.tree.selection())
@@ -292,6 +320,7 @@ class App:
         ttk.Label(game, text="Server (job) ID - optional:").pack(anchor="w", pady=(10, 0))
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
+        ttk.Button(game, text="Find server...", command=self.open_join_dialog).pack(anchor="w", pady=(6, 0))
         self.reload_places()
 
         act = ttk.LabelFrame(right, text="Actions", padding=8)
@@ -461,6 +490,7 @@ class App:
         if self._restored:
             self.sessions.save(self.manager.session_records(), clean=True)  # a deliberate quit
         self.manager.stop()
+        self.notifier.stop()
         self.watcher.stop()
         self.holder.disable()
         if self.tray:
@@ -706,6 +736,19 @@ class App:
             messagebox.showwarning("Group default", f"Applied, but could not save: {exc}")
         mi_log(f"[ok] Group {group!r} will launch place {place_id} when no game is picked.")
 
+    # ---- join tools -----------------------------------------------------
+    def open_join_dialog(self) -> None:
+        """Server finder window. Imported here, on demand, so the main window stays light."""
+        from join_dialog import JoinDialog
+        dlg = getattr(self, "_join_dlg", None)
+        try:
+            if dlg is not None and dlg.winfo_exists():
+                dlg.lift()
+                return
+        except tk.TclError:
+            pass
+        self._join_dlg = JoinDialog(self)
+
     # ---- auto-rejoin ----------------------------------------------------
     def toggle_selected_rejoin(self) -> None:
         accounts = self.selected_accounts()
@@ -839,7 +882,7 @@ class App:
                 try:
                     results = diagnostics.run_all(
                         store=self.store, holder=self.holder, include_network=True,
-                        extras={"settings": self.settings},
+                        extras={"settings": self.settings, "notifier": self.notifier},
                         progress=lambda m: self.ui(lambda m=m: show(m)))
                     report["text"] = diagnostics.format_report(results)
                 except Exception as exc:
@@ -924,7 +967,95 @@ class App:
             ttk.Entry(frm, textvariable=names[key], width=34).grid(row=row, column=1, padx=(12, 0))
             row += 1
 
+        # ---- notifications
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(frm, text="Notifications", font=("Segoe UI", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        event_vars: dict[str, tk.BooleanVar] = {}
+        for event, label in EVENT_LABELS.items():
+            event_vars[event] = tk.BooleanVar(value=event in self.settings["notifyEvents"])
+            ttk.Checkbutton(frm, text=label, variable=event_vars[event]).grid(
+                row=row, column=0, columnspan=2, sticky="w")
+            row += 1
+        notify_bools = {
+            "notifyTray": tk.BooleanVar(value=self.settings["notifyTray"]),
+            "notifyDiscord": tk.BooleanVar(value=self.settings["notifyDiscord"]),
+        }
+        ttk.Checkbutton(frm, text="Show a notice in the system tray" + ("" if self.tray else " (needs the tray: "
+                        "pip install pystray pillow)"), variable=notify_bools["notifyTray"]).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        row += 1
+        ttk.Checkbutton(frm, text="Send a Discord message", variable=notify_bools["notifyDiscord"]).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        cooldown_var = tk.IntVar(value=self.settings["notifyCooldownSeconds"])
+        ttk.Label(frm, text="Same event, same account at most every (seconds)").grid(
+            row=row, column=0, sticky="w", pady=3)
+        ttk.Spinbox(frm, from_=1, to=3600, textvariable=cooldown_var, width=6).grid(row=row, column=1, padx=(12, 0))
+        row += 1
+        have_webhook = secrets_store.has(notify_discord.WEBHOOK_SLOT)
+        webhook_var = tk.StringVar(value="(saved)" if have_webhook else "")
+        webhook_original = webhook_var.get()
+        ttk.Label(frm, text="Discord webhook URL").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(frm, textvariable=webhook_var, show="*", width=34).grid(row=row, column=1, padx=(12, 0))
+        row += 1
+        ttk.Label(frm, foreground="#777777", wraplength=420, justify="left",
+                  text="Stored encrypted, never logged. A row of stars means one is saved: clear it to remove "
+                       "the webhook, or paste a new URL to replace it. Create one in Discord under Server "
+                       "Settings > Integrations > Webhooks.").grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        test_label = ttk.Label(frm, text="", foreground="#777777")
+        test_label.grid(row=row, column=1, sticky="w", padx=(12, 0))
+
+        def commit_notify() -> bool:
+            """Validates and saves the notification part of this dialog. False = invalid, nothing saved."""
+            try:
+                cooldown = int(cooldown_var.get())
+                if not 1 <= cooldown <= 3600:
+                    raise ValueError
+            except (ValueError, tk.TclError):
+                messagebox.showwarning("Settings", "Notification cooldown: use 1-3600 seconds.", parent=win)
+                return False
+            url = webhook_var.get().strip()
+            changed = url != webhook_original
+            if changed and url and not notify_discord.is_discord_webhook(url):
+                messagebox.showwarning("Settings", "That is not a Discord webhook URL (it looks like "
+                                       "https://discord.com/api/webhooks/<number>/<token>).", parent=win)
+                return False
+            if changed:
+                try:
+                    if url:
+                        secrets_store.set(notify_discord.WEBHOOK_SLOT, url)
+                    else:
+                        secrets_store.delete(notify_discord.WEBHOOK_SLOT)
+                except OSError as exc:
+                    messagebox.showerror("Settings", f"Could not save the webhook: {exc}", parent=win)
+                    return False
+            self.settings["notifyEvents"] = [e for e, v in event_vars.items() if v.get()]
+            for key, var in notify_bools.items():
+                self.settings[key] = bool(var.get())
+            self.settings["notifyCooldownSeconds"] = cooldown
+            self.apply_notify_settings()
+            return True
+
+        def send_test() -> None:
+            if not commit_notify():
+                return
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+            self.notifier.notify("test", "test", "test message", force=True)
+            test_label.configure(text="Test sent. Check the log, Discord and the tray.")
+
+        ttk.Button(frm, text="Save and send test", command=send_test).grid(row=row, column=0, sticky="w")
+        row += 1
+
         def save() -> None:
+            if not commit_notify():
+                return
             try:
                 for key, label, lo, hi in spins:
                     value = int(vars_[key].get())

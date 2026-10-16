@@ -96,7 +96,7 @@ def check_data_dir():
 
 def check_data_files():
     results = []
-    for name in ("accounts.json", "places.json", "settings.json", "sessions.json"):
+    for name in ("accounts.json", "places.json", "settings.json", "sessions.json", "secrets.json"):
         path = DATA_DIR / name
         if not path.exists():
             results.append(_info(name, "not created yet"))
@@ -297,6 +297,74 @@ def check_groups(store, settings=None):
     return results
 
 
+def check_notifications(settings, notifier=None):
+    """Which channels are on, whether Discord has a usable webhook, and how the last send went.
+    The webhook URL itself is never put in the report."""
+    if settings is None:
+        return _skip("Notifications", "not available")
+    results = []
+    discord, tray = bool(settings.get("notifyDiscord")), bool(settings.get("notifyTray"))
+    events = [e for e in (settings.get("notifyEvents") or []) if isinstance(e, str)]
+    if not discord and not tray:
+        results.append(_warn("Notifications", "no channel is turned on, so nothing will be sent"))
+    else:
+        on = ", ".join(n for n, flag in (("Discord", discord), ("tray", tray)) if flag)
+        results.append(_info("Notifications", f"channels: {on}; events: {', '.join(events) or 'none'}; "
+                                              f"cooldown {settings.get('notifyCooldownSeconds', '?')} s"))
+        if not events:
+            results.append(_warn("Notification events", "no event is selected, so nothing will be sent"))
+    if discord:
+        import notify_discord
+        import secrets_store
+        try:
+            url = secrets_store.get(notify_discord.WEBHOOK_SLOT)
+        except Exception as exc:
+            url = None
+            results.append(_warn("Discord webhook", f"could not read the saved webhook ({exc!r})"))
+        else:
+            if not url:
+                results.append(_warn("Discord webhook", "Discord is on but no webhook is saved (or it cannot be "
+                                                        "decrypted on this PC). Paste one in Settings."))
+            elif not notify_discord.is_discord_webhook(url):
+                results.append(_warn("Discord webhook", "the saved value is not a Discord webhook URL"))
+            else:
+                results.append(_ok("Discord webhook", "saved and well-formed (not shown)"))
+    status = getattr(notifier, "last_status", None) or {}
+    for channel, ok in sorted(status.items()):
+        results.append(_ok(f"Last {channel} send", "succeeded") if ok else
+                       _warn(f"Last {channel} send", "failed (see the log for details)"))
+    return results
+
+
+def check_join_tools(include_network: bool = True):
+    """games.roblox.com (the server finder's source) and the result of the last finder run."""
+    import server_finder
+    results = []
+    if include_network:
+        # Any HTTP answer proves the host is reachable; 400/404 just mean this probe place is not listable.
+        url = server_finder.SERVERS_URL.format(place_id=1818) + "?limit=10"
+        code, extra = _probe(url, "GET")
+        if code is None:
+            results.append(_fail("Server list API", f"unreachable: {extra}"))
+        elif code in (404, 410):
+            results.append(_warn("Server list API", f"HTTP {code}: Roblox may have moved this endpoint ({url})"))
+        elif code >= 500:
+            results.append(_warn("Server list API", f"HTTP {code}: Roblox seems to be having problems"))
+        elif code == 429:
+            results.append(_warn("Server list API", "HTTP 429: rate limited right now (normal if you just used Find)"))
+        else:
+            results.append(_ok("Server list API", f"reachable, HTTP {code}"))
+    last = dict(server_finder.last_result)
+    if not last:
+        results.append(_info("Server finder", "not used yet in this session"))
+    elif last.get("error"):
+        results.append(_warn("Server finder", f"last run ({last['at']}, place {last['placeId']}): {last['error']}"))
+    else:
+        results.append(_info("Server finder", f"last run ({last['at']}, place {last['placeId']}, mode {last['mode']}): "
+                                              f"{last['count']} servers, picked {last['jobId'] or 'none'}"))
+    return results
+
+
 # --------------------------------------------------------------------------
 # Runner + report
 # --------------------------------------------------------------------------
@@ -313,7 +381,9 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
         steps.append(("Roblox web endpoints", check_network))
     steps += [("Multi-instance", lambda: check_multi_instance(holder)),
               ("Accounts", lambda: check_accounts(store, include_network)),
-              ("Groups", lambda: check_groups(store, extras.get("settings")))]
+              ("Groups", lambda: check_groups(store, extras.get("settings"))),
+              ("Notifications", lambda: check_notifications(extras.get("settings"), extras.get("notifier"))),
+              ("Join tools", lambda: check_join_tools(include_network))]
     results: list[Result] = []
     for label, fn in steps:
         if progress:

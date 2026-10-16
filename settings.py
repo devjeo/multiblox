@@ -37,6 +37,12 @@ DEFAULTS = {
     "rejoinAfterCrash": True,    # relaunch dead ones after an unclean exit (auto-rejoin accounts only)
     "mutexNames": "ROBLOX_singletonMutex",  # comma separated; change if a Roblox update renames them
     "eventNames": "ROBLOX_singletonEvent",
+    # Notifications (see notifier.py). The Discord webhook URL itself is NOT here: it is a
+    # secret and lives encrypted in secrets.json (secrets_store).
+    "notifyEvents": ["disconnect", "rejoin_gaveup", "cookie_invalid"],
+    "notifyDiscord": False,
+    "notifyTray": True,
+    "notifyCooldownSeconds": 120,  # same event for the same account is sent at most this often
     # Default game per account group: {"farm": {"placeId": 12345, "jobId": None}}
     "groupGames": {},
 }

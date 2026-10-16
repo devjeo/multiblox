@@ -194,7 +194,8 @@ class Client:
 class RejoinManager(threading.Thread):
     def __init__(self, store, launch_fn, list_pids_fn, kill_fn, log_fn=print,
                  log_dir: Path | None = None, creation_fn=process_creation_utc, presence_fn=None,
-                 clock=time.monotonic, sleep=time.sleep, spawn=None):
+                 clock=time.monotonic, sleep=time.sleep, spawn=None,
+                 notify_fn=None, on_ready_fn=None):
         super().__init__(daemon=True)
         self.store = store
         self.launch_fn = launch_fn      # (account, place_id, job_id) -> None, raises on failure
@@ -205,6 +206,8 @@ class RejoinManager(threading.Thread):
         self.creation_fn = creation_fn
         self.presence_fn = presence_fn or self._presence
         self.clock, self.sleep = clock, sleep
+        self.notify_fn = notify_fn      # (event, account_username, detail) -> None; see _emit
+        self.on_ready_fn = on_ready_fn  # (client) -> None, once a client's process is being tracked
         self._spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start())
         self.clients: dict[str, Client] = {}
         self._lock = threading.RLock()
@@ -435,8 +438,28 @@ class RejoinManager(threading.Thread):
             pass
 
     # ---- reacting -------------------------------------------------------
+    def _emit(self, event: str, c: Client, detail: str = "") -> None:
+        """Tell the optional notify callback. A broken callback must never break rejoining."""
+        if self.notify_fn is None:
+            return
+        try:
+            self.notify_fn(event, c.account.username, detail)
+        except Exception as exc:
+            self.log(f"[rejoin] notify callback failed: {exc!r}")
+
+    def _ready(self, c: Client) -> None:
+        if self.on_ready_fn is None:
+            return
+        try:
+            self.on_ready_fn(c)
+        except Exception as exc:
+            self.log(f"[rejoin] on-ready callback failed: {exc!r}")
+
     def _on_disconnect(self, c: Client, reason: str) -> None:
+        if c.cancelled:  # stopped on purpose a moment ago: that is not a disconnect
+            return
         self.log(f"[rejoin] {c.account.username}: disconnect detected - {reason}")
+        self._emit("disconnect", c, reason + ("" if c.account.autoRejoinEnabled else " (auto-rejoin is off)"))
         if not c.account.autoRejoinEnabled:
             c.state = "closed"
             self.log(f"[rejoin] {c.account.username}: auto-rejoin is OFF for this account; leaving it closed")
@@ -455,6 +478,8 @@ class RejoinManager(threading.Thread):
                 c.state = "gave_up"
                 self.log(f"[rejoin] {c.account.username}: gave up after {MAX_ATTEMPTS} attempts in "
                          f"{ATTEMPT_WINDOW_SECONDS // 60} min. Use 'resume' to try again.")
+                self._emit("rejoin_gaveup", c, f"gave up after {MAX_ATTEMPTS} attempts in "
+                                               f"{ATTEMPT_WINDOW_SECONDS // 60} min")
                 return
             c.attempts.append(now)
             n = len(c.attempts)
@@ -479,6 +504,9 @@ class RejoinManager(threading.Thread):
                 if getattr(exc, "fatal", False):
                     c.state = "gave_up"
                     self.log(f"[rejoin] {c.account.username}: giving up (this will not fix itself)")
+                    self._emit("rejoin_gaveup", c, f"relaunch failed and will not fix itself: {exc}")
+                    if getattr(exc, "reason", "") == "cookie_rejected":
+                        self._emit("cookie_invalid", c, "Roblox rejected this account's cookie; re-add the account")
                 else:
                     c.state, c.retry_at = "waiting_retry", self.clock() + RETRY_DELAY_SECONDS
                 return
@@ -508,6 +536,8 @@ class RejoinManager(threading.Thread):
                 except Exception:
                     c.created_utc = None
                 self.log(f"[rejoin] {c.account.username}: tracking client PID {c.pid}")
+                self._emit("launch", c, f"client started (PID {c.pid})")
+                self._ready(c)
                 return
             self.sleep(0.5)
         self.log(f"[rejoin] {c.account.username}: no new Roblox client appeared after launching")
