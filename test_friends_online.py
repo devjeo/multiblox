@@ -20,11 +20,16 @@ def presence(uid, state, place=None, job=None, loc=""):
 class FakeRoblox:
     def __init__(self, friend_list, presences):
         self.friend_list, self.presences, self.calls = friend_list, presences, []
+        self.online = None  # None: friends/online is refused, so the presence fallback is used
 
     def __call__(self, method, url, *, json_body=None, cookie=None, **kw):
         self.calls.append((method, url, json_body, cookie))
         if url == friends.FRIENDS_URL.format(user_id=5):
             return ok({"data": self.friend_list})
+        if url == friends.ONLINE_URL.format(user_id=5):
+            if self.online is None:
+                raise net.HttpError(404)
+            return ok({"data": self.online})
         if url == friends.PRESENCE_URL:
             return ok({"userPresences": [p for p in self.presences if p["userId"] in json_body["userIds"]]})
         raise AssertionError(url)
@@ -83,6 +88,20 @@ class OnlineFriendsTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             friends.online_friends("C", 0, fetch=fake)
         self.assertIn("user ID", friends.describe_error(cm.exception))
+
+    def test_friends_online_endpoint_is_used_with_game_instance_id(self):
+        fake = FakeRoblox(self.friend_list, [])
+        fake.online = [
+            {"id": 4, "sortScore": 1, "userPresence": {
+                "UserPresenceType": "InGame", "UserLocationType": "Game", "lastLocation": "Steal a Brainrot",
+                "placeId": 111, "rootPlaceId": 111, "gameInstanceId": "2db65b8f-4dd9-4ef5", "universeId": 9}},
+            {"id": 2, "userPresence": {"UserPresenceType": "Online"}},
+        ]
+        entries = friends.online_friends("COOKIE", 5, fetch=fake)
+        self.assertEqual([e.user.name for e in entries], ["Joinable_Pal", "Lobby_Girl"])
+        self.assertEqual(friends.resolve_join_target(entries[0].presence), (111, "2db65b8f-4dd9-4ef5"))
+        self.assertEqual(entries[0].status, "In a game - joinable")
+        self.assertNotIn(friends.PRESENCE_URL, [url for _m, url, _b, _c in fake.calls])
 
     def test_http_errors_propagate_for_the_dialog_to_describe(self):
         def boom(*a, **k):

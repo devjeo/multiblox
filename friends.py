@@ -29,12 +29,15 @@ USER_BY_ID_URL = "https://users.roblox.com/v1/users/{user_id}"
 USERNAMES_URL = "https://users.roblox.com/v1/usernames/users"
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 FRIENDS_URL = "https://friends.roblox.com/v1/users/{user_id}/friends"
+ONLINE_URL = "https://friends.roblox.com/v1/users/{user_id}/friends/online"
 PRESENCE_BATCH = 50  # user IDs per presence request
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 PROFILE_LINK_RE = re.compile(r"roblox\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?users/(\d{1,15})", re.IGNORECASE)
 MIN_JOB_ID_LENGTH = 8  # same rule the launcher uses to reject a mistyped job ID
 PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in a game", 3: "in Studio"}
+# The friends/online endpoint spells the presence type out instead of using a number.
+PRESENCE_TYPE_BY_NAME = {"offline": 0, "online": 1, "ingame": 2, "instudio": 3}
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,37 @@ def parse_user(item) -> User | None:
     return User(uid, name, display if isinstance(display, str) else "")
 
 
+def _job_id(value) -> str | None:
+    return value if isinstance(value, str) and len(value) >= MIN_JOB_ID_LENGTH else None
+
+
+def _presence_type(value) -> int | None:
+    if isinstance(value, str):
+        return PRESENCE_TYPE_BY_NAME.get(value.strip().lower())
+    return _int(value)
+
+
+def parse_online_presences(payload) -> dict[int, Presence]:
+    """friends/online JSON -> {friend id: Presence}. Entries look like
+    {"id": 1, "userPresence": {"UserPresenceType": "InGame", "placeId": .., "gameInstanceId": ..}}."""
+    found: dict[int, Presence] = {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for item in data or []:
+        if not isinstance(item, dict):
+            continue
+        uid, up = _positive(item.get("id")), item.get("userPresence")
+        if uid is None or not isinstance(up, dict):
+            continue
+        state = _presence_type(up.get("UserPresenceType", up.get("userPresenceType")))
+        if state is None:
+            continue
+        location = up.get("lastLocation")
+        found[uid] = Presence(uid, state, _positive(up.get("placeId")), _positive(up.get("rootPlaceId")),
+                              _job_id(up.get("gameInstanceId") or up.get("gameId")),
+                              location if isinstance(location, str) else "")
+    return found
+
+
 def parse_presence(payload, user_id: int) -> Presence | None:
     """Roblox JSON -> the entry for `user_id`. None when Roblox sent no entry for that user."""
     if not isinstance(payload, dict):
@@ -88,9 +122,7 @@ def parse_presence(payload, user_id: int) -> Presence | None:
         state = _int(item.get("userPresenceType"))
         if state is None:
             return None
-        game_id = item.get("gameId")
-        if not isinstance(game_id, str) or len(game_id) < MIN_JOB_ID_LENGTH:
-            game_id = None
+        game_id = _job_id(item.get("gameId") or item.get("gameInstanceId"))
         location = item.get("lastLocation")
         return Presence(user_id, state, _positive(item.get("placeId")), _positive(item.get("rootPlaceId")),
                         game_id, location if isinstance(location, str) else "")
@@ -194,9 +226,19 @@ def _sort_key(entry: FriendEntry):
 
 
 def online_friends(cookie: str, user_id: int, *, fetch=net.request) -> list[FriendEntry]:
-    """Friends of the account that are online (in a game, online, or in Studio), joinable first."""
+    """Friends of the account that are online (in a game, online, or in Studio), joinable first.
+    Uses Roblox's own friends/online list (it carries each friend's server ID); if that call is
+    refused, falls back to asking the presence API about every friend."""
     users = list_friends(user_id, fetch=fetch)
-    presences = get_presences(cookie, [u.id for u in users], fetch=fetch) if users else {}
+    if not users:
+        return []
+    try:
+        payload = fetch("GET", ONLINE_URL.format(user_id=user_id), cookie=cookie).json()
+        presences = parse_online_presences(payload)
+    except net.HttpError as exc:
+        if exc.status in (429, 401):
+            raise
+        presences = get_presences(cookie, [u.id for u in users], fetch=fetch)
     entries = [FriendEntry(u, presences[u.id]) for u in users
                if u.id in presences and presences[u.id].state != 0]
     return sorted(entries, key=_sort_key)
