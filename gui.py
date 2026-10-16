@@ -47,6 +47,7 @@ import diagnostics
 import groups
 import multi_instance
 import notify_discord
+import resourcesaver
 import secrets_store
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
@@ -162,8 +163,7 @@ class App:
         self.watcher.start()
         self.manager = RejoinManager(
             store=self.store,
-            launch_fn=lambda account, place_id, job_id, extra=None: launch_account(
-                self.store, account, place_id, job_id, extra=extra),
+            launch_fn=self._launch_fn,
             list_pids_fn=_running_pids,
             kill_fn=kill_pid,
             log_fn=mi_log,
@@ -193,6 +193,17 @@ class App:
         root.after(300, self.startup)
 
     # ---- helpers --------------------------------------------------------
+    def _launch_fn(self, account, place_id, job_id, extra=None):
+        """The RejoinManager's launch function. Flags are read when a client starts, so the resource
+        profile is put in place first; manual launches, rejoins and scheduled launches all pass here."""
+        self._pre_launch()
+        return launch_account(self.store, account, place_id, job_id, extra=extra)
+
+    def _pre_launch(self) -> None:
+        if not self.settings["applyProfileBeforeLaunch"] or self.settings["performanceProfile"] == "Normal":
+            return
+        resourcesaver.ensure_applied(self.settings["performanceProfile"], log_fn=mi_log)  # never raises
+
     def ui(self, fn) -> None:
         """Run `fn` on the Tk thread (safe to call from any thread)."""
         self.ui_q.put(fn)
@@ -1091,6 +1102,62 @@ class App:
         ttk.Button(frm, text="Save and send test", command=send_test).grid(row=row, column=0, sticky="w")
         row += 1
 
+        # ---- performance (resource saver)
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(frm, text="Performance", font=("Segoe UI", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        profile_var = tk.StringVar(value=self.settings["performanceProfile"]
+                                   if self.settings["performanceProfile"] in resourcesaver.PROFILES else "Normal")
+        profile_row = ttk.Frame(frm)
+        profile_row.grid(row=row, column=0, columnspan=2, sticky="w")
+        for name in resourcesaver.PROFILE_ORDER:
+            ttk.Radiobutton(profile_row, text=name, value=name, variable=profile_var).pack(side="left", padx=(0, 12))
+        row += 1
+        apply_before_var = tk.BooleanVar(value=self.settings["applyProfileBeforeLaunch"])
+        ttk.Checkbutton(frm, text="Apply the profile before every launch", variable=apply_before_var).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        perf_status = ttk.Label(frm, text="", foreground="#777777", wraplength=420, justify="left")
+        perf_status.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        def refresh_perf_status(prefix: str = "") -> None:
+            perf_status.configure(text=prefix + resourcesaver.describe(resourcesaver.status()))
+
+        def apply_perf_now() -> None:
+            path = _perf_path()
+            if path is None:
+                refresh_perf_status("Roblox install not found. ")
+                return
+            result = resourcesaver.apply_profile(
+                profile_var.get(), settings_path=path, state_path=resourcesaver.STATE_FILE, log_fn=mi_log)
+            refresh_perf_status(f"{result.status}: {result.detail}. " if result.detail else "")
+
+        def restore_perf() -> None:
+            path = _perf_path()
+            did = bool(path) and resourcesaver.restore(
+                settings_path=path, state_path=resourcesaver.STATE_FILE, log_fn=mi_log)
+            profile_var.set("Normal")
+            refresh_perf_status("Restored. " if did else "Nothing to restore. ")
+
+        def _perf_path():
+            vdir = resourcesaver.current_version_dir()
+            return resourcesaver.settings_path(vdir) if vdir else None
+
+        perf_btns = ttk.Frame(frm)
+        perf_btns.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(perf_btns, text="Apply now", command=apply_perf_now).pack(side="left")
+        ttk.Button(perf_btns, text="Restore original", command=restore_perf).pack(side="left", padx=6)
+        ttk.Label(frm, foreground="#777777", wraplength=420, justify="left",
+                  text="Roblox reads these flags when a client starts, so running clients are not affected. "
+                       "Only ClientSettings/ClientAppSettings.json in the newest Roblox version folder is "
+                       "written, and the original is backed up and put back on Restore."
+                  ).grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 2
+        refresh_perf_status()
+
         def save() -> None:
             if not commit_notify():
                 return
@@ -1105,6 +1172,8 @@ class App:
                 return
             for key, var in bools.items():
                 self.settings[key] = bool(var.get())
+            self.settings["performanceProfile"] = profile_var.get()
+            self.settings["applyProfileBeforeLaunch"] = bool(apply_before_var.get())
             for key, var in names.items():
                 self.settings[key] = var.get().strip() or DEFAULTS[key]
             self.settings.apply()

@@ -45,6 +45,9 @@ DEFAULTS = {
     "notifyCooldownSeconds": 120,  # same event for the same account is sent at most this often
     # Default game per account group: {"farm": {"placeId": 12345, "jobId": None}}
     "groupGames": {},
+    # Resource saver (see resourcesaver.py): client flags written before each launch.
+    "performanceProfile": "Normal",       # Normal | Low | Minimum
+    "applyProfileBeforeLaunch": False,
 }
 
 

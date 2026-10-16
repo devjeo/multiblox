@@ -96,7 +96,8 @@ def check_data_dir():
 
 def check_data_files():
     results = []
-    for name in ("accounts.json", "places.json", "settings.json", "sessions.json", "secrets.json"):
+    for name in ("accounts.json", "places.json", "settings.json", "sessions.json", "secrets.json",
+                 "resource_backup.json"):
         path = DATA_DIR / name
         if not path.exists():
             results.append(_info(name, "not created yet"))
@@ -336,6 +337,36 @@ def check_notifications(settings, notifier=None):
     return results
 
 
+def check_resourcesaver(settings=None, *, version_dir=None, roots=None, state_path=None):
+    """Settings file found and parses, backup consistent, content matches the chosen profile,
+    and a warning if Roblox updated (a newer version folder) since the profile was applied."""
+    import resourcesaver as rs
+    info = rs.status(version_dir=version_dir, roots=roots, state_path=state_path)
+    if info["versionDir"] is None:
+        return _info("Resource saver", "Roblox install not found (needs Versions/<ver>/RobloxPlayerBeta.exe)")
+    results = []
+    wanted = (settings.get("performanceProfile") if settings is not None else None) or "Normal"
+    before = bool(settings.get("applyProfileBeforeLaunch")) if settings is not None else False
+    results.append(_info("Resource saver", f"profile {wanted}, apply before launch: {'on' if before else 'off'}; "
+                                           f"{rs.describe(info)}"))
+    if info["fileExists"] and info["valid"] is False:
+        results.append(_warn("Resource saver file", f"{rs.SETTINGS_NAME} is not a valid JSON object. "
+                                                    "It is left untouched, so no profile can be applied."))
+    elif info["fileExists"]:
+        results.append(_ok("Resource saver file", f"{rs.SETTINGS_NAME} parses ({len(info['activeFlags'])} flag(s))"))
+    else:
+        results.append(_info("Resource saver file", f"no {rs.SETTINGS_NAME} in the newest version folder"))
+    if info["staleBackup"]:
+        results.append(_warn("Resource saver backup", "the backup refers to an older Roblox version folder "
+                                                      "(Roblox updated). It is cleaned up on the next apply."))
+    if wanted != "Normal" and before and info["matches"] != wanted:
+        results.append(_warn("Resource saver profile", f"{wanted} is selected but the file does not match yet; "
+                                                       "it is applied at the next launch."))
+    elif wanted == "Normal" and info["matches"]:
+        results.append(_warn("Resource saver profile", f"{info['matches']} is still active; press Restore original."))
+    return results
+
+
 def check_join_tools(include_network: bool = True):
     """games.roblox.com (the server finder's source), users.roblox.com (friend lookup) and the
     results of the last finder run and the last friend lookup."""
@@ -408,7 +439,8 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
               ("Accounts", lambda: check_accounts(store, include_network)),
               ("Groups", lambda: check_groups(store, extras.get("settings"))),
               ("Notifications", lambda: check_notifications(extras.get("settings"), extras.get("notifier"))),
-              ("Join tools", lambda: check_join_tools(include_network))]
+              ("Join tools", lambda: check_join_tools(include_network)),
+              ("Resource saver", lambda: check_resourcesaver(extras.get("settings")))]
     results: list[Result] = []
     for label, fn in steps:
         if progress:
