@@ -1,6 +1,6 @@
 """
-Join tools window. Today it holds one tab, "Server finder" (Feature C1); the friend
-and private-server tabs are added to the same Notebook by later phases.
+Join tools window. Tabs: "Server finder" (Feature C1) and "Join friend" (Feature C2); the
+private-server tab is added to the same Notebook by a later phase.
 
 Imported only when the "Find server..." button is pressed, so gui.py stays light.
 All network work runs through app.run_bg and results come back through app.ui.
@@ -11,6 +11,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import friends
 import server_finder as sf
 
 
@@ -18,7 +19,7 @@ class JoinDialog(tk.Toplevel):
     def __init__(self, app) -> None:
         super().__init__(app.root)
         self.app = app
-        self.title("Find a server")
+        self.title("Join tools")
         self.geometry("620x440")
         self.minsize(520, 360)
         self.transient(app.root)
@@ -31,6 +32,12 @@ class JoinDialog(tk.Toplevel):
         finder = ttk.Frame(self.nb, padding=10)
         self.nb.add(finder, text="Server finder")
         self._build_finder(finder)
+
+        self._friend_busy = False
+        self._friend_user: friends.User | None = None
+        friend = ttk.Frame(self.nb, padding=10)
+        self.nb.add(friend, text="Join friend")
+        self._build_friend(friend)
 
     # ---- UI -------------------------------------------------------------
     def _build_finder(self, parent: ttk.Frame) -> None:
@@ -74,6 +81,33 @@ class JoinDialog(tk.Toplevel):
         self.use_btn.pack(side="right", padx=6)
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self.use_btn.configure(state="normal" if self.tree.selection() else "disabled"))
+
+    def _build_friend(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Finds the server a friend is playing in and launches the selected account(s) "
+                               "into it. Uses the first selected account to ask Roblox, so select an account in "
+                               "the main window first. Roblox only shows a server to accounts the friend "
+                               "allows to join them.",
+                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w")
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="Username or ID:").pack(side="left")
+        self.friend_var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=self.friend_var, width=30)
+        entry.pack(side="left", padx=(6, 8))
+        entry.bind("<Return>", lambda e: self.lookup_friend())
+        self.lookup_btn = ttk.Button(row, text="Look up", command=self.lookup_friend)
+        self.lookup_btn.pack(side="left")
+
+        self.friend_name_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.friend_name_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 0))
+        self.friend_status_var = tk.StringVar(value="Type a username (or a user ID / profile link) and press Look up.")
+        ttk.Label(parent, textvariable=self.friend_status_var, wraplength=560, justify="left").pack(anchor="w", pady=(4, 0))
+
+        bottom = ttk.Frame(parent)
+        bottom.pack(side="bottom", fill="x")
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+        self.join_btn = ttk.Button(bottom, text="Join", command=self.join_friend, state="disabled")
+        self.join_btn.pack(side="right", padx=6)
 
     def _mode(self) -> str:
         label = self.mode_var.get()
@@ -159,4 +193,111 @@ class JoinDialog(tk.Toplevel):
             self.app.place_var.set(str(self._place_id))  # keep the server and the game together
         self.app.job_var.set(job_id)
         self.app.set_status("Server chosen. Launch an account to join it.")
+        self.destroy()
+
+    # ---- join friend ----------------------------------------------------
+    def _set_friend(self, name: str, status: str, joinable: bool) -> None:
+        try:
+            self.friend_name_var.set(name)
+            self.friend_status_var.set(status)
+            self.join_btn.configure(state="normal" if joinable else "disabled")
+        except tk.TclError:  # the window was closed while a lookup was running
+            pass
+
+    def _friend_done(self) -> None:
+        self._friend_busy = False
+        try:
+            self.lookup_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+
+    def _friend_presence(self, account, user: friends.User):
+        """Runs in a worker. The cookie lives only inside this call."""
+        cookie = self.app.store.get_cookie(account)
+        try:
+            return friends.get_presence(cookie, user.id)
+        finally:
+            del cookie
+
+    def lookup_friend(self) -> None:
+        if self._friend_busy:
+            return
+        accounts = self.app.selected_accounts()
+        if not accounts:
+            messagebox.showinfo("Join friend", "Select an account in the main window first. It is used to ask "
+                                               "Roblox where your friend is.", parent=self)
+            return
+        query = self.friend_var.get().strip()
+        if not query:
+            return
+        asker = accounts[0]
+        self._friend_busy = True
+        self.lookup_btn.configure(state="disabled")
+        self._friend_user = None
+        self._set_friend("", "Looking up...", False)
+
+        def work() -> None:
+            user = None
+            try:
+                user = friends.find_user(query)
+                if user is None:
+                    friends.record_result(None, "no such user")
+                    self.app.ui(lambda: (self._friend_done(), self._set_friend(
+                        "", "No Roblox user found for that name or ID.", False)))
+                    return
+                presence = self._friend_presence(asker, user)
+                target = friends.resolve_join_target(presence)
+                friends.record_result(user.id, "joinable" if target else "unavailable")
+                text = friends.describe_presence(presence)
+                title = user.name if not user.display_name or user.display_name == user.name \
+                    else f"{user.display_name} (@{user.name})"
+                self.app.ui(lambda: (self._friend_done(), self._remember(user), self._set_friend(
+                    title, text, target is not None)))
+            except Exception as exc:
+                text = friends.describe_error(exc)
+                friends.record_result(user.id if user else None, "error", error=text)
+                self.app.ui(lambda: (self._friend_done(), self._set_friend("", text, False)))
+        self.app.run_bg(work)
+
+    def _remember(self, user: friends.User) -> None:
+        self._friend_user = user
+
+    def join_friend(self) -> None:
+        """Asks Roblox again (the friend may have moved), then launches the selected accounts there."""
+        user = self._friend_user
+        accounts = self.app.selected_accounts()
+        if user is None or self._friend_busy:
+            return
+        if not accounts:
+            messagebox.showinfo("Join friend", "Select the account(s) to launch in the main window first.", parent=self)
+            return
+        asker = accounts[0]
+        self._friend_busy = True
+        self.lookup_btn.configure(state="disabled")
+        self.join_btn.configure(state="disabled")
+        self.friend_status_var.set("Checking where they are now...")
+
+        def work() -> None:
+            try:
+                presence = self._friend_presence(asker, user)
+                target = friends.resolve_join_target(presence)
+                if target is None:
+                    friends.record_result(user.id, "unavailable")
+                    text = friends.describe_presence(presence)
+                    self.app.ui(lambda: (self._friend_done(), self._set_friend(
+                        self.friend_name_var.get(), "They are no longer joinable. " + text, False)))
+                    return
+                friends.record_result(user.id, "joined")
+                place_id, job_id = target
+                self.app.ui(lambda: self._launch(accounts, place_id, job_id))
+            except Exception as exc:
+                text = friends.describe_error(exc)
+                friends.record_result(user.id, "error", error=text)
+                self.app.ui(lambda: (self._friend_done(), self._set_friend(self.friend_name_var.get(), text, False)))
+        self.app.run_bg(work)
+
+    def _launch(self, accounts: list, place_id: int, job_id: str) -> None:
+        self._friend_done()
+        self.app.launch_accounts(accounts, place_id, job_id)  # the existing job-ID launch path
+        self.app.set_status("Joining your friend's server...")
         self.destroy()

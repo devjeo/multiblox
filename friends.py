@@ -1,0 +1,188 @@
+"""
+Friend join (Feature C2): look a user up, see which server they are in, join it.
+
+  find_user(query)            username, user ID, @name or a roblox.com/users/<id> link -> User
+  get_presence(cookie, id)    one user's presence; needs a logged-in account (the cookie)
+  resolve_join_target(p)      (placeId, jobId) when the user is in a game AND Roblox shows where
+
+Pure logic: no Tk, no Windows. The network call is the `fetch` parameter (default
+net.request), so tests pass a fake. Joining itself uses the existing job-ID launch path.
+
+Privacy: Roblox only reveals a user's server to accounts allowed to see it (normally friends,
+and only if the user's "who can join me" setting permits). When it is hidden, presence says
+"in game" but placeId / gameId are empty; resolve_join_target returns None and
+describe_presence says 'unavailable'. A cookie is passed to net.request only, never logged,
+and never stored here.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+
+import net
+
+USER_BY_ID_URL = "https://users.roblox.com/v1/users/{user_id}"
+USERNAMES_URL = "https://users.roblox.com/v1/usernames/users"
+PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+PROFILE_LINK_RE = re.compile(r"roblox\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?users/(\d{1,15})", re.IGNORECASE)
+MIN_JOB_ID_LENGTH = 8  # same rule the launcher uses to reject a mistyped job ID
+PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in a game", 3: "in Studio"}
+
+
+@dataclass(frozen=True)
+class User:
+    id: int
+    name: str
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class Presence:
+    user_id: int
+    state: int                      # 0 offline, 1 online, 2 in game, 3 in Studio
+    place_id: int | None = None
+    root_place_id: int | None = None
+    game_id: str | None = None      # the server (job) ID
+    last_location: str = ""
+
+
+# --------------------------------------------------------------------------
+# Parsing helpers
+# --------------------------------------------------------------------------
+def _int(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _positive(value) -> int | None:
+    n = _int(value)
+    return n if n is not None and n > 0 else None
+
+
+def parse_user(item) -> User | None:
+    if not isinstance(item, dict):
+        return None
+    uid, name = _positive(item.get("id")), item.get("name")
+    if uid is None or not isinstance(name, str) or not name:
+        return None
+    display = item.get("displayName")
+    return User(uid, name, display if isinstance(display, str) else "")
+
+
+def parse_presence(payload, user_id: int) -> Presence | None:
+    """Roblox JSON -> the entry for `user_id`. None when Roblox sent no entry for that user."""
+    if not isinstance(payload, dict):
+        return None
+    for item in payload.get("userPresences") or []:
+        if not isinstance(item, dict) or _int(item.get("userId")) != user_id:
+            continue
+        state = _int(item.get("userPresenceType"))
+        if state is None:
+            return None
+        game_id = item.get("gameId")
+        if not isinstance(game_id, str) or len(game_id) < MIN_JOB_ID_LENGTH:
+            game_id = None
+        location = item.get("lastLocation")
+        return Presence(user_id, state, _positive(item.get("placeId")), _positive(item.get("rootPlaceId")),
+                        game_id, location if isinstance(location, str) else "")
+    return None
+
+
+# --------------------------------------------------------------------------
+# Lookups
+# --------------------------------------------------------------------------
+def find_user(query: str, *, fetch=net.request) -> User | None:
+    """All digits -> look up by ID. A roblox.com/users/<id> link -> by ID. Otherwise a username
+    (a leading @ is ignored). None = no such user, or the text cannot be a Roblox name.
+    Raises net.HttpError when Roblox does not answer (429 = rate limited)."""
+    text = (query or "").strip()
+    if text.startswith("@"):
+        text = text[1:].strip()
+    link = PROFILE_LINK_RE.search(text)
+    if link:
+        text = link.group(1)
+    if text.isascii() and text.isdigit():
+        user_id = int(text)
+        if user_id <= 0:
+            return None
+        try:
+            return parse_user(fetch("GET", USER_BY_ID_URL.format(user_id=user_id)).json())
+        except net.HttpError as exc:
+            if exc.status in (400, 404):  # unknown or banned user
+                return None
+            raise
+    if not USERNAME_RE.match(text):
+        return None
+    body = {"usernames": [text], "excludeBannedUsers": True}
+    payload = fetch("POST", USERNAMES_URL, json_body=body).json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for item in data or []:
+        user = parse_user(item)
+        if user is not None:
+            return user
+    return None
+
+
+def get_presence(cookie: str, user_id: int, *, fetch=net.request) -> Presence | None:
+    """Presence of `user_id` as seen by the account that owns `cookie`. None = Roblox returned no
+    entry. Raises net.HttpError on failure (401/403 usually means the cookie was rejected)."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be a positive integer")
+    resp = fetch("POST", PRESENCE_URL, json_body={"userIds": [user_id]}, cookie=cookie)
+    return parse_presence(resp.json(), user_id)
+
+
+def resolve_join_target(presence: Presence | None) -> tuple[int, str] | None:
+    """(placeId, jobId) if the user is in a game and Roblox shows which server; else None."""
+    if presence is None or presence.state != 2:
+        return None
+    if presence.place_id is None or presence.game_id is None:
+        return None
+    return presence.place_id, presence.game_id
+
+
+# --------------------------------------------------------------------------
+# Messages + last result (for the dialog and diagnostics)
+# --------------------------------------------------------------------------
+def describe_presence(presence: Presence | None) -> str:
+    if presence is None:
+        return "Roblox returned no status for this user."
+    if presence.state == 2:
+        if resolve_join_target(presence) is None:
+            return ("In a game, but unavailable: their privacy settings hide the server from this account "
+                    "(or it is a private server).")
+        where = f" ({presence.last_location})" if presence.last_location else ""
+        return f"In a game{where}. Joinable."
+    return f"Not joinable: {PRESENCE_NAMES.get(presence.state, 'unknown status')}."
+
+
+def describe_error(exc: Exception) -> str:
+    if isinstance(exc, net.HttpError):
+        if exc.status == 429:
+            return "Roblox is rate-limiting lookups right now. Wait a minute and try again."
+        if exc.status == 0:
+            return f"Could not reach Roblox ({exc.reason or 'network error'})."
+        if exc.status in (401, 403):
+            return "Roblox rejected the selected account's login. Refresh that account's cookie and try again."
+        return f"Roblox returned HTTP {exc.status}."
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return f"Unexpected error: {exc!r}"
+
+
+last_result: dict = {}
+_last_lock = threading.Lock()
+
+
+def record_result(user_id: int | None, outcome: str, error: str | None = None) -> None:
+    """Remembers the latest friend lookup/join for Diagnostics. Never stores a cookie or a job ID."""
+    with _last_lock:
+        last_result.clear()
+        last_result.update(userId=user_id, outcome=outcome, error=error,
+                           at=datetime.now().isoformat(timespec="seconds"))

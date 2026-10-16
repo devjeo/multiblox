@@ -1,8 +1,8 @@
 """
-Join-tools tests (Feature C1: server finder). Run:  python -m unittest test_joins -v
+Join-tools tests (Feature C1: server finder, Feature C2: friend join). Run:  python -m unittest test_joins -v
 
 No Windows, Roblox or network: `fetch` is a scripted fake, and the rate-limit test
-fakes net's urlopen. (The friend and private-server tests are added in later phases.)
+fakes net's urlopen. (The private-server tests are added in a later phase.)
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import urllib.parse
 from unittest import mock
 
 import diagnostics
+import friends
 import net
 import server_finder as sf
 from server_finder import Server
@@ -218,6 +219,196 @@ class DiagnosticsTests(unittest.TestCase):
             results = diagnostics.run_all(store=None, holder=None, include_network=True)
         self.assertTrue(any(r.name == "Server list API" and r.level == "FAIL" for r in results))
         self.assertTrue(all("crashed" not in r.detail for r in results))
+
+
+# ==========================================================================
+# Feature C2: friend join
+# ==========================================================================
+def ok(payload):
+    return net.Response(200, {}, json.dumps(payload).encode())
+
+
+class AnyFetch:
+    """Scripted stand-in for net.request that records method, url and keyword arguments."""
+
+    def __init__(self, *outcomes):
+        self.outcomes, self.calls = list(outcomes), []
+
+    def __call__(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+JOB = "11111111-2222-3333-4444-555555555555"
+
+
+def pres(state=2, place=606849621, root=606849621, game=JOB, user=42, where="Jailbreak"):
+    return {"userPresences": [{"userPresenceType": state, "lastLocation": where, "placeId": place,
+                               "rootPlaceId": root, "gameId": game, "universeId": 1, "userId": user,
+                               "lastOnline": "2026-10-16T08:00:00Z"}]}
+
+
+class FindUserTests(unittest.TestCase):
+    def test_find_user_by_id_and_name(self):
+        by_id = AnyFetch(ok({"id": 42, "name": "Builderman", "displayName": "Builder"}))
+        user = friends.find_user("42", fetch=by_id)
+        self.assertEqual(user, friends.User(42, "Builderman", "Builder"))
+        self.assertEqual(by_id.calls[0][:2], ("GET", "https://users.roblox.com/v1/users/42"))
+
+        by_name = AnyFetch(ok({"data": [{"requestedUsername": "builderman", "id": 42, "name": "Builderman",
+                                         "displayName": "Builder"}]}))
+        self.assertEqual(friends.find_user("builderman", fetch=by_name).id, 42)
+        method, url, kw = by_name.calls[0]
+        self.assertEqual((method, url), ("POST", friends.USERNAMES_URL))
+        self.assertEqual(kw["json_body"], {"usernames": ["builderman"], "excludeBannedUsers": True})
+        self.assertNotIn("cookie", kw)  # name lookup is anonymous
+
+    def test_at_sign_and_profile_link_are_understood(self):
+        f = AnyFetch(ok({"id": 7, "name": "A_b"}), ok({"id": 9, "name": "Zed"}))
+        self.assertEqual(friends.find_user("https://www.roblox.com/users/7/profile", fetch=f).id, 7)
+        self.assertEqual(friends.find_user("  https://www.roblox.com/de/users/9/profile ", fetch=f).id, 9)
+        by_name = AnyFetch(ok({"data": [{"id": 5, "name": "Cool_Kid"}]}))
+        self.assertEqual(friends.find_user("@Cool_Kid", fetch=by_name).name, "Cool_Kid")
+        self.assertEqual(by_name.calls[0][2]["json_body"]["usernames"], ["Cool_Kid"])
+
+    def test_unknown_user_is_none_and_text_that_cannot_be_a_name_makes_no_request(self):
+        for text in ("", "   ", "ab", "a" * 21, "has space", "bad-char!", "0", "-5", "\u0663\u0664"):
+            f = AnyFetch()
+            self.assertIsNone(friends.find_user(text, fetch=f), text)
+            self.assertEqual(f.calls, [], text)
+        self.assertIsNone(friends.find_user("nobody_here", fetch=AnyFetch(ok({"data": []}))))
+        self.assertIsNone(friends.find_user("123456", fetch=AnyFetch(net.HttpError(404))))
+        self.assertIsNone(friends.find_user("123456", fetch=AnyFetch(net.HttpError(400))))
+
+    def test_other_failures_propagate(self):
+        with self.assertRaises(net.HttpError) as cm:
+            friends.find_user("123456", fetch=AnyFetch(net.HttpError(429)))
+        self.assertIn("rate-limiting", friends.describe_error(cm.exception))
+        with self.assertRaises(net.HttpError):
+            friends.find_user("someone", fetch=AnyFetch(net.HttpError(0, reason="dns down")))
+
+    def test_odd_payloads_are_none_not_exceptions(self):
+        for payload in ([], "x", {"data": "x"}, {"data": [None, 5, {"id": "1", "name": "A"}, {"id": 3}]}):
+            self.assertIsNone(friends.find_user("someone", fetch=AnyFetch(ok(payload))), payload)
+        self.assertIsNone(friends.find_user("123456", fetch=AnyFetch(ok({"id": -1, "name": "A"}))))
+
+
+class PresenceTests(unittest.TestCase):
+    def test_visible_server_resolves(self):
+        p = friends.get_presence("COOKIE", 42, fetch=AnyFetch(ok(pres())))
+        self.assertEqual(friends.resolve_join_target(p), (606849621, JOB))
+        self.assertIn("Joinable", friends.describe_presence(p))
+        self.assertIn("Jailbreak", friends.describe_presence(p))
+
+    def test_presence_hidden_returns_none(self):
+        # Default privacy: Roblox says "in game" but withholds where.
+        p = friends.get_presence("COOKIE", 42, fetch=AnyFetch(ok(pres(place=None, root=None, game=None))))
+        self.assertEqual(p.state, 2)
+        self.assertIsNone(friends.resolve_join_target(p))
+        self.assertIn("unavailable", friends.describe_presence(p))
+        # A place without a server ID, or a server ID without a place, is just as unusable.
+        self.assertIsNone(friends.resolve_join_target(friends.get_presence("C", 42, fetch=AnyFetch(ok(pres(game=None))))))
+        self.assertIsNone(friends.resolve_join_target(friends.get_presence("C", 42, fetch=AnyFetch(ok(pres(place=None))))))
+        # A too-short game ID is treated as missing, like the launcher's job ID check.
+        self.assertIsNone(friends.resolve_join_target(friends.get_presence("C", 42, fetch=AnyFetch(ok(pres(game="abc"))))))
+
+    def test_resolve_join_target_offline_none(self):
+        for state in (0, 1, 3):  # offline, online, Studio: never joinable, even if ids are present
+            p = friends.get_presence("C", 42, fetch=AnyFetch(ok(pres(state=state))))
+            self.assertIsNone(friends.resolve_join_target(p), state)
+            self.assertIn("Not joinable", friends.describe_presence(p))
+        self.assertIsNone(friends.resolve_join_target(None))
+
+    def test_request_shape_carries_cookie_to_net_only(self):
+        f = AnyFetch(ok(pres()))
+        friends.get_presence("SECRET-COOKIE", 42, fetch=f)
+        method, url, kw = f.calls[0]
+        self.assertEqual((method, url), ("POST", "https://presence.roblox.com/v1/presence/users"))
+        self.assertEqual(kw["json_body"], {"userIds": [42]})
+        self.assertEqual(kw["cookie"], "SECRET-COOKIE")
+
+    def test_entry_for_another_user_or_bad_shapes_give_none(self):
+        self.assertIsNone(friends.get_presence("C", 42, fetch=AnyFetch(ok(pres(user=99)))))
+        for payload in ({}, [], {"userPresences": []}, {"userPresences": ["x", None]},
+                        {"userPresences": [{"userId": 42}]}, {"userPresences": [{"userId": 42, "userPresenceType": "2"}]}):
+            self.assertIsNone(friends.get_presence("C", 42, fetch=AnyFetch(ok(payload))), payload)
+
+    def test_invalid_user_id_is_refused_before_any_request(self):
+        for bad in (0, -1, True, "42", None):
+            f = AnyFetch()
+            with self.assertRaises(ValueError):
+                friends.get_presence("C", bad, fetch=f)
+            self.assertEqual(f.calls, [], bad)
+
+    def test_a_rejected_cookie_is_reported_without_leaking_it(self):
+        with self.assertRaises(net.HttpError) as cm:
+            friends.get_presence("SECRET-COOKIE", 42, fetch=AnyFetch(net.HttpError(401, url=friends.PRESENCE_URL)))
+        text = friends.describe_error(cm.exception)
+        self.assertIn("rejected", text)
+        self.assertNotIn("SECRET-COOKIE", text + str(cm.exception))
+
+    def test_presence_goes_through_net_with_the_csrf_handshake(self):
+        seen = []
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.status, resp.headers = 200, {}
+        resp.read.return_value = json.dumps(pres()).encode()
+        outcomes = [urllib.error.HTTPError(friends.PRESENCE_URL, 403, "csrf", {"x-csrf-token": "TOKEN"}, io.BytesIO(b"")),
+                    resp]
+
+        def fake_open(req, timeout):
+            seen.append(dict(req.header_items()))
+            out = outcomes.pop(0)
+            if isinstance(out, Exception):
+                raise out
+            return out
+        with mock.patch.object(net, "_open", fake_open), mock.patch.object(net, "_sleep", lambda s: None):
+            p = friends.get_presence("COOKIE", 42)  # the real net.request
+        self.assertEqual(friends.resolve_join_target(p), (606849621, JOB))
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[1].get("X-csrf-token"), "TOKEN")
+        self.assertIn(".ROBLOSECURITY=COOKIE", seen[1].get("Cookie", ""))
+
+    def test_error_messages(self):
+        self.assertIn("Could not reach", friends.describe_error(net.HttpError(0, reason="dns down")))
+        self.assertIn("HTTP 503", friends.describe_error(net.HttpError(503)))
+        self.assertIn("positive", friends.describe_error(ValueError("user_id must be a positive integer")))
+        self.assertIn("no status", friends.describe_presence(None))
+
+
+class FriendDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        friends.last_result.clear()
+        sf.last_result.clear()
+        self.addCleanup(friends.last_result.clear)
+        self.addCleanup(sf.last_result.clear)
+
+    def test_unused_session_adds_no_friend_line(self):
+        self.assertFalse(any(r.name == "Friend join" for r in diagnostics.check_join_tools(include_network=False)))
+
+    def test_last_lookup_is_reported_without_secrets(self):
+        friends.record_result(42, "unavailable")
+        [r] = [r for r in diagnostics.check_join_tools(include_network=False) if r.name == "Friend join"]
+        self.assertEqual(r.level, "INFO")
+        self.assertIn("user 42", r.detail)
+        self.assertIn("unavailable", r.detail)
+        friends.record_result(42, "error", error="Roblox rejected the selected account's login.")
+        [r] = [r for r in diagnostics.check_join_tools(include_network=False) if r.name == "Friend join"]
+        self.assertEqual(r.level, "WARN")
+        friends.record_result(None, "no such user")
+        [r] = [r for r in diagnostics.check_join_tools(include_network=False) if r.name == "Friend join"]
+        self.assertIn("no user", r.detail)
+
+    def test_user_api_probe_classification(self):
+        cases = [((200, {}), "OK"), ((404, {}), "WARN"), ((429, {}), "WARN"), ((503, {}), "WARN"),
+                 ((None, "dns failure"), "FAIL")]
+        for answer, level in cases:
+            with mock.patch.object(diagnostics, "_probe", lambda url, method, a=answer: a):
+                [r] = [r for r in diagnostics.check_join_tools(True) if r.name == "User lookup API"]
+            self.assertEqual(r.level, level, answer)
 
 
 if __name__ == "__main__":

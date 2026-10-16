@@ -337,7 +337,9 @@ def check_notifications(settings, notifier=None):
 
 
 def check_join_tools(include_network: bool = True):
-    """games.roblox.com (the server finder's source) and the result of the last finder run."""
+    """games.roblox.com (the server finder's source), users.roblox.com (friend lookup) and the
+    results of the last finder run and the last friend lookup."""
+    import friends
     import server_finder
     results = []
     if include_network:
@@ -354,6 +356,18 @@ def check_join_tools(include_network: bool = True):
             results.append(_warn("Server list API", "HTTP 429: rate limited right now (normal if you just used Find)"))
         else:
             results.append(_ok("Server list API", f"reachable, HTTP {code}"))
+        # Friend lookup also needs presence.roblox.com, but that one requires a login, so only users is probed.
+        code, extra = _probe(friends.USER_BY_ID_URL.format(user_id=1), "GET")
+        if code is None:
+            results.append(_fail("User lookup API", f"unreachable: {extra}"))
+        elif code in (404, 410):
+            results.append(_warn("User lookup API", f"HTTP {code}: Roblox may have moved this endpoint"))
+        elif code == 429:
+            results.append(_warn("User lookup API", "HTTP 429: rate limited right now (normal if you just used Look up)"))
+        elif code >= 500:
+            results.append(_warn("User lookup API", f"HTTP {code}: Roblox seems to be having problems"))
+        else:
+            results.append(_ok("User lookup API", f"reachable, HTTP {code}"))
     last = dict(server_finder.last_result)
     if not last:
         results.append(_info("Server finder", "not used yet in this session"))
@@ -362,6 +376,12 @@ def check_join_tools(include_network: bool = True):
     else:
         results.append(_info("Server finder", f"last run ({last['at']}, place {last['placeId']}, mode {last['mode']}): "
                                               f"{last['count']} servers, picked {last['jobId'] or 'none'}"))
+    friend = dict(friends.last_result)  # shown only after a lookup, so an unused session adds no line
+    if friend.get("error"):
+        results.append(_warn("Friend join", f"last lookup ({friend['at']}): {friend['error']}"))
+    elif friend:
+        who = f"user {friend['userId']}" if friend.get("userId") else "no user"
+        results.append(_info("Friend join", f"last lookup ({friend['at']}, {who}): {friend['outcome']}"))
     return results
 
 
