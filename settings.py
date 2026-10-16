@@ -48,6 +48,11 @@ DEFAULTS = {
     # Resource saver (see resourcesaver.py): client flags written before each launch.
     "performanceProfile": "Normal",       # Normal | Low | Minimum
     "applyProfileBeforeLaunch": False,
+    # Window layout (see winlayout.py)
+    "layoutMonitor": 0,        # 0 = first monitor (the primary one)
+    "layoutColumns": 3,
+    "layoutGap": 4,
+    "layoutAutoTile": False,
 }
 
 

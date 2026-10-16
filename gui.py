@@ -48,6 +48,8 @@ import groups
 import multi_instance
 import notify_discord
 import resourcesaver
+import winapi
+import winlayout
 import secrets_store
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
@@ -147,6 +149,9 @@ class App:
         self.launching: dict[str, str] = {}  # account id -> "Queued..." / "Launching..."
         self.tray = None
         self._closing = False
+        self._winapi = None            # built on first use (window layout)
+        self._autotiler = None
+        self.last_tile: dict | None = None
 
         # Notifications. Built BEFORE the rejoin manager, which reports events to it. The tray
         # channel looks the icon up lazily because the tray is created later.
@@ -168,6 +173,7 @@ class App:
             kill_fn=kill_pid,
             log_fn=mi_log,
             notify_fn=lambda event, account, detail: self.notifier.notify(event, account, detail),
+            on_ready_fn=self._on_client_ready,
         )
         self.manager.start()
 
@@ -198,6 +204,70 @@ class App:
         profile is put in place first; manual launches, rejoins and scheduled launches all pass here."""
         self._pre_launch()
         return launch_account(self.store, account, place_id, job_id, extra=extra)
+
+    # ---- window layout --------------------------------------------------
+    def winapi(self):
+        """The Win32 window API, or None if it cannot be built."""
+        if self._winapi is None:
+            try:
+                self._winapi = winapi.real_api()
+            except Exception as exc:
+                mi_log(f"[layout] window control is unavailable: {exc!r}")
+        return self._winapi
+
+    def _client_windows(self):
+        """(api, window handles of running clients in account-list order, number of running clients)."""
+        api = self.winapi()
+        if api is None:
+            return None, [], 0
+        with self.manager._lock:
+            pid_by_account = {aid: c.pid for aid, c in self.manager.clients.items()
+                              if c.pid and c.state == "running"}
+        hwnd_by_pid = api.enum_windows_for_pids(set(pid_by_account.values()))
+        return api, winlayout.order_hwnds(self.store.accounts, pid_by_account, hwnd_by_pid), len(pid_by_account)
+
+    def _tile_job(self) -> str:
+        """Tiles the running clients. Runs on a worker thread; returns a status line."""
+        api, hwnds, clients = self._client_windows()
+        if api is None:
+            return "Window control is unavailable."
+        moved = winlayout.tile(api, hwnds, self.settings["layoutMonitor"], self.settings["layoutColumns"],
+                               gap=self.settings["layoutGap"], log_fn=mi_log)
+        self.last_tile = {"clients": clients, "matched": len(hwnds), "moved": moved, "at": time.time()}
+        text = f"Tiled {moved} of {clients} client window(s)."
+        mi_log(f"[layout] {text}")
+        return text
+
+    def tile_windows(self) -> None:
+        self.run_bg(lambda: self.set_status(self._tile_job()))
+
+    def minimize_windows(self) -> None:
+        def work() -> None:
+            api, hwnds, _ = self._client_windows()
+            if api is not None:
+                self.set_status(f"Minimized {winlayout.minimize_all(api, hwnds)} client window(s).")
+        self.run_bg(work)
+
+    def restore_windows(self) -> None:
+        def work() -> None:
+            api, hwnds, _ = self._client_windows()
+            if api is not None:
+                self.set_status(f"Restored {winlayout.restore_all(api, hwnds)} client window(s).")
+        self.run_bg(work)
+
+    def _on_client_ready(self, client) -> None:
+        """RejoinManager callback (manager thread): a client's process is being tracked. Launches,
+        rejoins and scheduled launches all come through here."""
+        if not self.settings["layoutAutoTile"] or not client.pid or self._closing:
+            return
+        api = self.winapi()
+        if api is None:
+            return
+        if self._autotiler is None:
+            self._autotiler = winlayout.AutoTiler(
+                api, self._tile_job, enabled_fn=lambda: self.settings["layoutAutoTile"] and not self._closing,
+                log_fn=mi_log)
+        self.run_bg(self._autotiler.on_ready, client.pid)
 
     def _pre_launch(self) -> None:
         if not self.settings["applyProfileBeforeLaunch"] or self.settings["performanceProfile"] == "Normal":
@@ -357,6 +427,12 @@ class App:
             ttk.Button(act, text=text, command=cmd).pack(fill="x", pady=2)
         self.group_btn = ttk.Button(act, text="Launch group", command=self.launch_group, state="disabled")
         self.group_btn.pack(fill="x", pady=2)
+        ttk.Separator(act).pack(fill="x", pady=4)
+        ttk.Button(act, text="Tile windows", command=self.tile_windows).pack(fill="x", pady=2)
+        wrow = ttk.Frame(act)
+        wrow.pack(fill="x", pady=2)
+        ttk.Button(wrow, text="Minimize all", command=self.minimize_windows).pack(side="left", expand=True, fill="x")
+        ttk.Button(wrow, text="Restore all", command=self.restore_windows).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         acc = ttk.LabelFrame(right, text="Manage", padding=8)
         acc.pack(fill="x", pady=(10, 0))
@@ -931,7 +1007,8 @@ class App:
                 try:
                     results = diagnostics.run_all(
                         store=self.store, holder=self.holder, include_network=True,
-                        extras={"settings": self.settings, "notifier": self.notifier},
+                        extras={"settings": self.settings, "notifier": self.notifier,
+                                "winapi": self.winapi(), "last_tile": self.last_tile},
                         progress=lambda m: self.ui(lambda m=m: show(m)))
                     report["text"] = diagnostics.format_report(results)
                 except Exception as exc:
@@ -1102,6 +1179,36 @@ class App:
         ttk.Button(frm, text="Save and send test", command=send_test).grid(row=row, column=0, sticky="w")
         row += 1
 
+        # ---- layout
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(frm, text="Window layout", font=("Segoe UI", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        api = self.winapi()
+        try:
+            monitors = api.get_monitors() if api else []
+        except Exception:
+            monitors = []
+        monitor_labels = [f"{m.index + 1}: {m.work.w}x{m.work.h}" for m in monitors] or ["1"]
+        ttk.Label(frm, text="Tile onto monitor").grid(row=row, column=0, sticky="w", pady=3)
+        saved_monitor = self.settings["layoutMonitor"]
+        monitor_var = tk.StringVar(value=monitor_labels[saved_monitor if 0 <= saved_monitor < len(monitor_labels) else 0])
+        ttk.Combobox(frm, textvariable=monitor_var, values=monitor_labels, state="readonly", width=16).grid(
+            row=row, column=1, padx=(12, 0), sticky="w")
+        row += 1
+        layout_vars: dict[str, tk.Variable] = {}
+        for key, label, lo, hi in (("layoutColumns", "Columns", 1, 6), ("layoutGap", "Gap between windows (px)", 0, 32)):
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            layout_vars[key] = tk.IntVar(value=self.settings[key])
+            ttk.Spinbox(frm, from_=lo, to=hi, textvariable=layout_vars[key], width=6).grid(
+                row=row, column=1, padx=(12, 0), sticky="w")
+            row += 1
+        auto_tile_var = tk.BooleanVar(value=self.settings["layoutAutoTile"])
+        ttk.Checkbutton(frm, text="Tile automatically when a client starts or rejoins",
+                        variable=auto_tile_var).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
         # ---- performance (resource saver)
         ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
         row += 1
@@ -1172,6 +1279,17 @@ class App:
                 return
             for key, var in bools.items():
                 self.settings[key] = bool(var.get())
+            try:
+                columns, gap = int(layout_vars["layoutColumns"].get()), int(layout_vars["layoutGap"].get())
+                if not (1 <= columns <= 6 and 0 <= gap <= 32):
+                    raise ValueError("Columns: use 1-6, gap: use 0-32")
+            except (ValueError, tk.TclError) as exc:
+                messagebox.showwarning("Settings", f"Invalid layout value. {exc}", parent=win)
+                return
+            self.settings["layoutColumns"], self.settings["layoutGap"] = columns, gap
+            self.settings["layoutMonitor"] = max(0, monitor_labels.index(monitor_var.get())
+                                                 if monitor_var.get() in monitor_labels else 0)
+            self.settings["layoutAutoTile"] = bool(auto_tile_var.get())
             self.settings["performanceProfile"] = profile_var.get()
             self.settings["applyProfileBeforeLaunch"] = bool(apply_before_var.get())
             for key, var in names.items():

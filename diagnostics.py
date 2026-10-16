@@ -367,6 +367,37 @@ def check_resourcesaver(settings=None, *, version_dir=None, roots=None, state_pa
     return results
 
 
+def check_layout(settings=None, api=None, last_tile=None):
+    """Monitors found, whether the saved monitor index still exists (it falls back to monitor 1 if
+    not), and the result of the last tile (windows matched vs moved)."""
+    if api is None:
+        return _skip("Window layout", "window control not available")
+    try:
+        monitors = api.get_monitors()
+    except Exception as exc:
+        return _fail("Window layout", f"could not list monitors: {exc!r}")
+    if not monitors:
+        return _fail("Window layout", "no monitors were reported")
+    listing = ", ".join(f"{m.index + 1}: {m.work.w}x{m.work.h} at {m.dpi} dpi" for m in monitors)
+    results = [_ok("Monitors", listing)]
+    if settings is not None:
+        saved = settings.get("layoutMonitor", 0)
+        if not isinstance(saved, int) or not 0 <= saved < len(monitors):
+            results.append(_warn("Layout monitor", f"saved monitor {saved + 1 if isinstance(saved, int) else '?'} "
+                                                   "is not connected; monitor 1 is used instead"))
+        dpis = {m.dpi for m in monitors}
+        if len(dpis) > 1:
+            results.append(_info("Layout DPI", "monitors use different scaling; check the tiles line up"))
+    if last_tile:
+        line = (f"{last_tile.get('clients', 0)} running client(s), {last_tile.get('matched', 0)} with a window, "
+                f"{last_tile.get('moved', 0)} moved")
+        results.append(_ok("Last tile", line) if last_tile.get("moved") == last_tile.get("clients") else
+                       _warn("Last tile", line + " (a client may be fullscreen or still starting)"))
+    else:
+        results.append(_info("Last tile", "not run yet in this session"))
+    return results
+
+
 def check_join_tools(include_network: bool = True):
     """games.roblox.com (the server finder's source), users.roblox.com (friend lookup) and the
     results of the last finder run and the last friend lookup."""
@@ -440,7 +471,9 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
               ("Groups", lambda: check_groups(store, extras.get("settings"))),
               ("Notifications", lambda: check_notifications(extras.get("settings"), extras.get("notifier"))),
               ("Join tools", lambda: check_join_tools(include_network)),
-              ("Resource saver", lambda: check_resourcesaver(extras.get("settings")))]
+              ("Resource saver", lambda: check_resourcesaver(extras.get("settings"))),
+              ("Window layout", lambda: check_layout(extras.get("settings"), extras.get("winapi"),
+                                                     extras.get("last_tile")))]
     results: list[Result] = []
     for label, fn in steps:
         if progress:
