@@ -30,6 +30,9 @@ class FakeRoblox:
             if self.online is None:
                 raise net.HttpError(404)
             return ok({"data": self.online})
+        if url == friends.USERS_BATCH_URL:
+            return ok({"data": [{"id": i, "name": f"name{i}", "displayName": f"name{i}"}
+                                for i in json_body["userIds"]]})
         if url == friends.PRESENCE_URL:
             return ok({"userPresences": [p for p in self.presences if p["userId"] in json_body["userIds"]]})
         raise AssertionError(url)
@@ -80,7 +83,7 @@ class OnlineFriendsTests(unittest.TestCase):
     def test_no_friends_makes_no_presence_call(self):
         fake = FakeRoblox([], [])
         self.assertEqual(friends.online_friends("C", 5, fetch=fake), [])
-        self.assertEqual(len(fake.calls), 1)
+        self.assertNotIn(friends.PRESENCE_URL, [url for _m, url, _b, _c in fake.calls])
 
     def test_bad_data_is_skipped_and_bad_user_id_is_explained(self):
         fake = FakeRoblox([{"id": "x"}, None, {"id": 2, "name": "Ok_Name"}], [presence(2, 1)])
@@ -90,7 +93,7 @@ class OnlineFriendsTests(unittest.TestCase):
         self.assertIn("user ID", friends.describe_error(cm.exception))
 
     def test_friends_online_endpoint_is_used_with_game_instance_id(self):
-        fake = FakeRoblox(self.friend_list, [])
+        fake = FakeRoblox([{"id": 4, "name": "", "displayName": ""}, {"id": 2, "name": "", "displayName": ""}], [])
         fake.online = [
             {"id": 4, "sortScore": 1, "userPresence": {
                 "UserPresenceType": "InGame", "UserLocationType": "Game", "lastLocation": "Steal a Brainrot",
@@ -98,10 +101,17 @@ class OnlineFriendsTests(unittest.TestCase):
             {"id": 2, "userPresence": {"UserPresenceType": "Online"}},
         ]
         entries = friends.online_friends("COOKIE", 5, fetch=fake)
-        self.assertEqual([e.user.name for e in entries], ["Joinable_Pal", "Lobby_Girl"])
+        self.assertEqual([e.user.name for e in entries], ["name4", "name2"])  # names looked up, blank in /friends
         self.assertEqual(friends.resolve_join_target(entries[0].presence), (111, "2db65b8f-4dd9-4ef5"))
         self.assertEqual(entries[0].status, "In a game - joinable")
         self.assertNotIn(friends.PRESENCE_URL, [url for _m, url, _b, _c in fake.calls])
+        self.assertNotIn(friends.FRIENDS_URL.format(user_id=5), [url for _m, url, _b, _c in fake.calls])
+
+    def test_blank_names_in_friends_list_do_not_hide_friends_in_fallback(self):
+        blank = [{"id": 4, "name": "", "displayName": ""}]
+        fake = FakeRoblox(blank, [presence(4, 2, place=111, job="job-abcdefgh")])
+        entries = friends.online_friends("C", 5, fetch=fake)
+        self.assertEqual([(e.user.id, e.user.name, e.joinable) for e in entries], [(4, "name4", True)])
 
     def test_http_errors_propagate_for_the_dialog_to_describe(self):
         def boom(*a, **k):

@@ -29,6 +29,7 @@ USER_BY_ID_URL = "https://users.roblox.com/v1/users/{user_id}"
 USERNAMES_URL = "https://users.roblox.com/v1/usernames/users"
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 FRIENDS_URL = "https://friends.roblox.com/v1/users/{user_id}/friends"
+USERS_BATCH_URL = "https://users.roblox.com/v1/users"
 ONLINE_URL = "https://friends.roblox.com/v1/users/{user_id}/friends/online"
 PRESENCE_BATCH = 50  # user IDs per presence request
 
@@ -174,14 +175,38 @@ def get_presence(cookie: str, user_id: int, *, fetch=net.request) -> Presence | 
 
 
 def list_friends(user_id: int, *, fetch=net.request) -> list[User]:
-    """The friends of `user_id` (a friends list is public, so no cookie is needed).
-    Raises net.HttpError on failure."""
+    """The friends of `user_id` (a friends list is public, so no cookie is needed). Roblox now
+    returns blank names here, so a friend with a valid ID but no name is kept with name "" and
+    online_friends looks the names up separately. Raises net.HttpError on failure."""
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
         raise ValueError("This account has no Roblox user ID saved. Re-add the account.")
     payload = fetch("GET", FRIENDS_URL.format(user_id=user_id)).json()
     data = payload.get("data") if isinstance(payload, dict) else None
-    users = [u for u in (parse_user(item) for item in data or []) if u is not None]
+    users = []
+    for item in data or []:
+        uid = _positive(item.get("id")) if isinstance(item, dict) else None
+        if uid is None:
+            continue
+        name, display = item.get("name"), item.get("displayName")
+        users.append(User(uid, name if isinstance(name, str) else "", display if isinstance(display, str) else ""))
     return users
+
+
+def lookup_names(user_ids: list[int], *, fetch=net.request) -> dict[int, User]:
+    """Names for user IDs (users.roblox.com batch call, no cookie). Best effort: IDs Roblox does
+    not answer for are simply missing from the result."""
+    found: dict[int, User] = {}
+    for i in range(0, len(user_ids), 100):
+        chunk = list(user_ids[i:i + 100])
+        try:
+            payload = fetch("POST", USERS_BATCH_URL, json_body={"userIds": chunk, "excludeBannedUsers": False}).json()
+        except net.HttpError:
+            continue
+        for item in (payload.get("data") if isinstance(payload, dict) else None) or []:
+            user = parse_user(item)
+            if user is not None:
+                found[user.id] = user
+    return found
 
 
 def get_presences(cookie: str, user_ids: list[int], *, fetch=net.request) -> dict[int, Presence]:
@@ -227,20 +252,29 @@ def _sort_key(entry: FriendEntry):
 
 def online_friends(cookie: str, user_id: int, *, fetch=net.request) -> list[FriendEntry]:
     """Friends of the account that are online (in a game, online, or in Studio), joinable first.
-    Uses Roblox's own friends/online list (it carries each friend's server ID); if that call is
-    refused, falls back to asking the presence API about every friend."""
-    users = list_friends(user_id, fetch=fetch)
-    if not users:
-        return []
+    Uses Roblox's own friends/online list, which carries each friend's server ID, and looks the
+    names up separately. If that call is refused, falls back to the friends list plus the
+    presence API."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("This account has no Roblox user ID saved. Re-add the account.")
+    known: dict[int, User] = {}
     try:
         payload = fetch("GET", ONLINE_URL.format(user_id=user_id), cookie=cookie).json()
         presences = parse_online_presences(payload)
     except net.HttpError as exc:
         if exc.status in (429, 401):
             raise
-        presences = get_presences(cookie, [u.id for u in users], fetch=fetch)
-    entries = [FriendEntry(u, presences[u.id]) for u in users
-               if u.id in presences and presences[u.id].state != 0]
+        users = list_friends(user_id, fetch=fetch)
+        known = {u.id: u for u in users if u.name}
+        presences = get_presences(cookie, [u.id for u in users], fetch=fetch) if users else {}
+    online_ids = [uid for uid, p in presences.items() if p.state != 0]
+    missing = [uid for uid in online_ids if uid not in known]
+    if missing:
+        known.update(lookup_names(missing, fetch=fetch))
+    entries = []
+    for uid in online_ids:
+        user = known.get(uid) or User(uid, f"User {uid}")
+        entries.append(FriendEntry(user, presences[uid]))
     return sorted(entries, key=_sort_key)
 
 
