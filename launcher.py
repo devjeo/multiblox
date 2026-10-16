@@ -45,6 +45,7 @@ import urllib.request
 import uuid
 
 import groups
+import private_links
 from account_store import Account, AccountStore
 from autorejoin import RejoinManager
 from places import PlaceStore, fetch_place_name, parse_place_input
@@ -125,11 +126,22 @@ def fetch_game_name(cookie: str, place_id: int) -> str | None:
 # --------------------------------------------------------------------------
 # Launch link
 # --------------------------------------------------------------------------
-def build_launch_uri(ticket: str, place_id: int, job_id: str | None = None) -> str:
-    """Builds the roblox-player: link. With job_id, joins that specific server."""
+def build_launch_uri(ticket: str, place_id: int, job_id: str | None = None, *,
+                     extra: dict | None = None) -> str:
+    """Builds the roblox-player: link. With job_id, joins that specific server. With `extra`
+    holding a private-server code (see private_links), joins that private server instead and
+    job_id is ignored. Raises ValueError for a malformed private-server code."""
     tracker = random.randint(10**11, 10**12 - 1)
     attempt = str(uuid.uuid4())
-    if job_id:
+    if private_links.is_private(extra):
+        access, link, origin = private_links.validate(extra)
+        place_url = (
+            "https://www.roblox.com/Game/PlaceLauncher.ashx?request=RequestPrivateGame"
+            f"&browserTrackerId={tracker}&placeId={place_id}"
+            f"&accessCode={urllib.parse.quote(access, safe='')}&linkCode={urllib.parse.quote(link, safe='')}"
+            f"&joinAttemptId={attempt}&joinAttemptOrigin={origin}"
+        )
+    elif job_id:
         place_url = (
             "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGameJob"
             f"&browserTrackerId={tracker}&placeId={place_id}&gameId={job_id}"
@@ -152,8 +164,17 @@ def build_launch_uri(ticket: str, place_id: int, job_id: str | None = None) -> s
     )
 
 
-def launch_account(store: AccountStore, account: Account, place_id: int, job_id: str | None = None) -> None:
-    """Launches one account. Raises LaunchError on failure."""
+def launch_account(store: AccountStore, account: Account, place_id: int, job_id: str | None = None,
+                   *, extra: dict | None = None) -> None:
+    """Launches one account. Raises LaunchError on failure. `extra` (private-server code) is used
+    for this launch only; it is never saved."""
+    private = private_links.is_private(extra)
+    if private:
+        job_id = None
+        try:
+            private_links.validate(extra)  # refuse a malformed code before any ticket is requested
+        except ValueError as exc:
+            raise LaunchError(str(exc), fatal=True) from None
     try:
         cookie = store.get_cookie(account)
     except OSError as exc:
@@ -167,7 +188,7 @@ def launch_account(store: AccountStore, account: Account, place_id: int, job_id:
     finally:
         del cookie
 
-    uri = build_launch_uri(ticket, place_id, job_id)
+    uri = build_launch_uri(ticket, place_id, job_id, extra=extra if private else None)
     del ticket
     try:
         os.startfile(uri)  # hands the link to Roblox's registered roblox-player handler
@@ -454,7 +475,8 @@ def main() -> None:
     from multi_instance import log as mi_log
     manager = RejoinManager(
         store=store,
-        launch_fn=lambda account, place_id, job_id: launch_account(store, account, place_id, job_id),
+        launch_fn=lambda account, place_id, job_id, extra=None: launch_account(
+            store, account, place_id, job_id, extra=extra),
         list_pids_fn=_running_pids,
         kill_fn=kill_pid,
         log_fn=mi_log,

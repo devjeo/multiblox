@@ -69,9 +69,15 @@ def restore(manager, store, records: list[dict], clean: bool,
         if account is None or not place_id:
             counts["dropped"] += 1
             continue
-        if manager.adopt(account, int(place_id), rec.get("jobId"), rec.get("pid"), rec.get("createdUtc")):
+        private = bool(rec.get("private"))
+        if manager.adopt(account, int(place_id), rec.get("jobId"), rec.get("pid"), rec.get("createdUtc"),
+                         private=private):
             counts["adopted"] += 1
             log(f"[restore] {account.username}: client still running (PID {rec.get('pid')}); watching it again")
+        elif private:
+            counts["dropped"] += 1
+            log(f"[restore] {account.username}: its private-server client is gone; not relaunching it "
+                "(private-server codes are never saved, and a relaunch would land in a public server)")
         elif not clean and rejoin_after_crash and account.autoRejoinEnabled:
             counts["recovered"] += 1
             log(f"[restore] {account.username}: client is gone and the last run did not exit cleanly; relaunching")

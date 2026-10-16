@@ -189,6 +189,11 @@ class Client:
     attempts: deque = field(default_factory=deque)
     cancelled: bool = False   # set by stop_account / a newer launch: abandon any rejoin in progress
     created_utc: datetime | None = None  # process start time, used to re-attach after an app restart
+    # Private-server launch data (see private_links). In memory only, hidden from repr. `private`
+    # stays True for an adopted client whose code was (deliberately) not saved; such a client is
+    # never relaunched into a public server.
+    extra: dict | None = field(default=None, repr=False)
+    private: bool = False
 
 
 class RejoinManager(threading.Thread):
@@ -199,6 +204,7 @@ class RejoinManager(threading.Thread):
         super().__init__(daemon=True)
         self.store = store
         self.launch_fn = launch_fn      # (account, place_id, job_id) -> None, raises on failure
+                                        # (private servers: also called with extra=<dict>)
         self.list_pids = list_pids_fn   # () -> set[int] of running game-client PIDs
         self.kill_fn = kill_fn          # (pid) -> None
         self.log = log_fn
@@ -215,13 +221,18 @@ class RejoinManager(threading.Thread):
         self._stop_event = threading.Event()
 
     # ---- public API ----------------------------------------------------
-    def launch(self, account, place_id: int, job_id: str | None = None) -> Client:
+    def launch(self, account, place_id: int, job_id: str | None = None, extra: dict | None = None) -> Client:
         """Launch an account, wait until its client appears, and start tracking it.
-        Raises whatever launch_fn raises (LaunchError)."""
+        `extra` is private-server launch data (see private_links); it is kept in memory for
+        rejoins and never saved. Raises whatever launch_fn raises (LaunchError)."""
         with self._launch_lock:
-            client = Client(account, place_id, job_id)
+            private = bool(extra)
+            client = Client(account, place_id, None if private else job_id, extra=extra or None, private=private)
             before = set(self.list_pids())
-            self.launch_fn(account, place_id, job_id)
+            if private:
+                self.launch_fn(account, place_id, None, extra=extra)
+            else:
+                self.launch_fn(account, place_id, job_id)
             with self._lock:
                 old = self.clients.get(account.id)
                 if old is not None:
@@ -266,14 +277,17 @@ class RejoinManager(threading.Thread):
             for c in self.clients.values():
                 if c.cancelled or c.state not in ("running", "starting", "rejoining", "waiting_retry"):
                     continue
-                out.append({
+                rec = {
                     "accountId": c.account.id, "placeId": c.place_id, "jobId": c.job_id, "pid": c.pid,
                     "createdUtc": c.created_utc.isoformat() if c.created_utc else None,
-                })
+                }
+                if c.private:
+                    rec["private"] = True  # only the fact: the private-server code is never written to disk
+                out.append(rec)
         return out
 
     def adopt(self, account, place_id: int, job_id: str | None, pid: int | None,
-              created_iso: str | None) -> bool:
+              created_iso: str | None, private: bool = False) -> bool:
         """Re-attach to a client that outlived an app restart. Refuses if the PID is gone or
         now belongs to a different process (recycled PID: creation times differ)."""
         if not pid or pid not in set(self.list_pids()):
@@ -293,7 +307,7 @@ class RejoinManager(threading.Thread):
         with self._lock:
             if any(x.pid == pid for x in self.clients.values()):
                 return False
-            c = Client(account, place_id, job_id)
+            c = Client(account, place_id, job_id, private=private)
             c.pid, c.state = pid, "running"
             age = (datetime.now(timezone.utc) - actual).total_seconds() if actual else 0.0
             c.started = self.clock() - max(age, 0.0)
@@ -471,6 +485,15 @@ class RejoinManager(threading.Thread):
         with self._launch_lock:
             if c.cancelled or self._stop_event.is_set():
                 return
+            if c.private and not c.extra:
+                # Re-attached after an app restart: the private-server code was not kept, and
+                # "any server" would drop this account into a public server.
+                c.state = "gave_up"
+                self.log(f"[rejoin] {c.account.username}: was in a private server and its code is never saved, "
+                         "so it cannot rejoin it after an app restart. Launch it again from Find server... > "
+                         "Private server.")
+                self._emit("rejoin_gaveup", c, "private server cannot be rejoined after an app restart")
+                return
             now = self.clock()
             while c.attempts and now - c.attempts[0] > ATTEMPT_WINDOW_SECONDS:
                 c.attempts.popleft()
@@ -495,10 +518,15 @@ class RejoinManager(threading.Thread):
             if c.cancelled or self._stop_event.is_set():  # Stop / quit pressed during the cooldown
                 self.log(f"[rejoin] {c.account.username}: rejoin cancelled")
                 return
-            job = c.job_id if n == 1 else None  # first try: same server; later: any server
+            private = bool(c.extra)
+            # public: first try same server, later any server. private: always the same private server.
+            job = None if private else (c.job_id if n == 1 else None)
             before = set(self.list_pids())
             try:
-                self.launch_fn(c.account, c.place_id, job)
+                if private:
+                    self.launch_fn(c.account, c.place_id, None, extra=c.extra)
+                else:
+                    self.launch_fn(c.account, c.place_id, job)
             except Exception as exc:
                 self.log(f"[rejoin] {c.account.username}: relaunch failed - {exc}")
                 if getattr(exc, "fatal", False):
@@ -512,7 +540,7 @@ class RejoinManager(threading.Thread):
                 return
             c.job_id = job
             self.log(f"[rejoin] {c.account.username}: relaunched (attempt {n}/{MAX_ATTEMPTS}, "
-                     f"{'same server' if job else 'any server'})")
+                     f"{'same private server' if private else 'same server' if job else 'any server'})")
             self._await_pid(c, before)
             self.sleep(SETTLE_SECONDS)
 

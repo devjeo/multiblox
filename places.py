@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +49,95 @@ def parse_place_input(text: str) -> tuple[int | None, str | None]:
     if m:
         return int(m.group(1)), None
     return None, None
+
+
+# --------------------------------------------------------------------------
+# Links that can carry a server (Feature C3)
+# --------------------------------------------------------------------------
+_CODE_RE = re.compile(r"^[A-Za-z0-9_\-]{6,128}$")        # access / link / share codes
+_JOB_RE = re.compile(r"^[A-Za-z0-9\-]{8,64}$")           # server (job) IDs
+_ORIGIN_RE = re.compile(r"^[A-Za-z]{1,40}$")              # joinAttemptOrigin, copied from a launch link
+_LAUNCHER_FIELD_RE = re.compile(r"placelauncherurl:([^+\s]+)", re.I)
+_SHARE_RE = re.compile(r"roblox\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?share\?([^\s#]+)", re.I)
+
+
+@dataclass(frozen=True)
+class PlaceInput:
+    """What a pasted link says. Codes are secrets: they are hidden from repr and never logged."""
+    place_id: int | None = None
+    job_id: str | None = None
+    access_code: str | None = field(default=None, repr=False)
+    link_code: str | None = field(default=None, repr=False)
+    share_code: str | None = field(default=None, repr=False)
+    origin: str | None = None      # joinAttemptOrigin as Roblox sent it
+    verified: bool = False         # True only when read from a roblox-player: launch link
+
+    @property
+    def is_private(self) -> bool:
+        return bool(self.access_code or self.link_code)
+
+
+def _first(query: dict, key: str) -> str | None:
+    values = query.get(key)
+    return values[0] if values else None
+
+
+def _launcher_query(raw: str) -> dict | None:
+    """The PlaceLauncher.ashx query of a roblox-player: launch link (or of the bare launcher URL)."""
+    m = _LAUNCHER_FIELD_RE.search(raw)
+    if m:
+        candidate = urllib.parse.unquote(m.group(1))
+    elif "placelauncher.ashx" in raw.lower():
+        candidate = urllib.parse.unquote(raw) if "%3f" in raw.lower() else raw
+    else:
+        return None
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(candidate).query, keep_blank_values=True)
+
+
+def _from_launcher_query(query: dict) -> PlaceInput | None:
+    place = _first(query, "placeId")
+    place_id = int(place) if place and place.isascii() and place.isdigit() and int(place) > 0 else None
+    request = (_first(query, "request") or "").lower()
+    if place_id is None:
+        return None  # RequestFollowUser and friends carry no place
+    if request == "requestprivategame":
+        access, link = _first(query, "accessCode") or "", _first(query, "linkCode") or ""
+        access = access if _CODE_RE.match(access) else None
+        link = link if _CODE_RE.match(link) else None
+        if not access and not link:
+            return None
+        origin = _first(query, "joinAttemptOrigin") or ""
+        return PlaceInput(place_id, None, access, link, None, origin if _ORIGIN_RE.match(origin) else None, True)
+    if request == "requestgamejob":
+        job = _first(query, "gameId") or ""
+        return PlaceInput(place_id, job if _JOB_RE.match(job) else None, verified=True)
+    if request == "requestgame":
+        return PlaceInput(place_id, verified=True)
+    return None
+
+
+def parse_place_link(text: str) -> PlaceInput | None:
+    """Understands a roblox-player: launch link, a game link (with or without a private-server link
+    code), a roblox.com/share link, or a plain place ID. None = nothing usable.
+    `parse_place_input` (above) is the older, simpler parser and is left as it was."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    query = _launcher_query(raw)
+    if query is not None:
+        return _from_launcher_query(query)
+    share = _SHARE_RE.search(raw)
+    if share:
+        code = _first(urllib.parse.parse_qs(share.group(1), keep_blank_values=True), "code") or ""
+        return PlaceInput(share_code=code) if _CODE_RE.match(code) else None
+    place_id, _ = parse_place_input(raw)
+    if place_id is None:
+        return None
+    link = None
+    m = re.search(r"[?&]privateServerLinkCode=([^&#\s]+)", raw, re.I)
+    if m and _CODE_RE.match(urllib.parse.unquote(m.group(1))):
+        link = urllib.parse.unquote(m.group(1))
+    return PlaceInput(place_id, link_code=link)
 
 
 def _get_json(url: str):

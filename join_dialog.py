@@ -1,6 +1,6 @@
 """
-Join tools window. Tabs: "Server finder" (Feature C1) and "Join friend" (Feature C2); the
-private-server tab is added to the same Notebook by a later phase.
+Join tools window. Tabs: "Server finder" (Feature C1), "Join friend" (Feature C2) and
+"Private server" (Feature C3, experimental).
 
 Imported only when the "Find server..." button is pressed, so gui.py stays light.
 All network work runs through app.run_bg and results come back through app.ui.
@@ -12,7 +12,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import friends
+import private_links
 import server_finder as sf
+from places import parse_place_link
 
 
 class JoinDialog(tk.Toplevel):
@@ -38,6 +40,11 @@ class JoinDialog(tk.Toplevel):
         friend = ttk.Frame(self.nb, padding=10)
         self.nb.add(friend, text="Join friend")
         self._build_friend(friend)
+
+        self._parsed = None  # the last parsed private-server link (memory only)
+        private = ttk.Frame(self.nb, padding=10)
+        self.nb.add(private, text="Private server")
+        self._build_private(private)
 
     # ---- UI -------------------------------------------------------------
     def _build_finder(self, parent: ttk.Frame) -> None:
@@ -108,6 +115,28 @@ class JoinDialog(tk.Toplevel):
         ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
         self.join_btn = ttk.Button(bottom, text="Join", command=self.join_friend, state="disabled")
         self.join_btn.pack(side="right", padx=6)
+
+    def _build_private(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="EXPERIMENTAL. Join your private server once in your browser (the game's "
+                               "Private Servers list, then Join), copy the roblox-player:... text that "
+                               "appears, and paste it here. The app keeps only the place and the server code "
+                               "(in memory, never saved) and discards the login ticket in it.",
+                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w")
+        self.private_var = tk.StringVar()
+        entry = ttk.Entry(parent, textvariable=self.private_var)
+        entry.pack(fill="x", pady=(10, 0))
+        entry.bind("<Return>", lambda e: self.parse_private())
+        ttk.Button(parent, text="Parse", command=self.parse_private).pack(anchor="w", pady=(8, 0))
+        self.private_status_var = tk.StringVar(value="Paste the text above, then press Parse.")
+        ttk.Label(parent, textvariable=self.private_status_var, wraplength=560, justify="left").pack(anchor="w", pady=(10, 0))
+        ttk.Label(parent, text="While armed, Launch selected joins this private server and auto-rejoin returns "
+                               "to it (never to a public server). Editing the Game or Server box un-arms it.",
+                  foreground="#777777", wraplength=560, justify="left").pack(anchor="w", pady=(10, 0))
+        bottom = ttk.Frame(parent)
+        bottom.pack(side="bottom", fill="x")
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+        self.arm_btn = ttk.Button(bottom, text="Arm", command=self.arm_private, state="disabled")
+        self.arm_btn.pack(side="right", padx=6)
 
     def _mode(self) -> str:
         label = self.mode_var.get()
@@ -300,4 +329,24 @@ class JoinDialog(tk.Toplevel):
         self._friend_done()
         self.app.launch_accounts(accounts, place_id, job_id)  # the existing job-ID launch path
         self.app.set_status("Joining your friend's server...")
+        self.destroy()
+
+    # ---- private server -------------------------------------------------
+    def parse_private(self) -> None:
+        text = self.private_var.get()
+        parsed = parse_place_link(text)
+        can_arm, message = private_links.assess(parsed)
+        self._parsed = parsed if can_arm else None
+        self.private_var.set("")  # the pasted text holds a login ticket: do not leave it in the box
+        self.private_status_var.set(message)
+        self.arm_btn.configure(state="normal" if can_arm else "disabled")
+
+    def arm_private(self) -> None:
+        extra = private_links.extra_from(self._parsed)
+        if extra is None or self._parsed is None or self._parsed.place_id is None:
+            return
+        place_id = self._parsed.place_id
+        self.app.arm_private(extra, place_id)
+        private_links.record_result("armed", place_id)
+        self.app.set_status("Private server armed. Launch an account to join it.")
         self.destroy()

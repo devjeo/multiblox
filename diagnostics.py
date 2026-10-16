@@ -340,6 +340,7 @@ def check_join_tools(include_network: bool = True):
     """games.roblox.com (the server finder's source), users.roblox.com (friend lookup) and the
     results of the last finder run and the last friend lookup."""
     import friends
+    import private_links
     import server_finder
     results = []
     if include_network:
@@ -382,6 +383,10 @@ def check_join_tools(include_network: bool = True):
     elif friend:
         who = f"user {friend['userId']}" if friend.get("userId") else "no user"
         results.append(_info("Friend join", f"last lookup ({friend['at']}, {who}): {friend['outcome']}"))
+    private = dict(private_links.last_result)  # shown only after use; private servers are experimental
+    if private:
+        results.append(_info("Private server (experimental)",
+                             f"last action ({private['at']}): {private['event']}, place {private['placeId']}"))
     return results
 
 

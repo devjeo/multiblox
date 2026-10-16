@@ -162,7 +162,8 @@ class App:
         self.watcher.start()
         self.manager = RejoinManager(
             store=self.store,
-            launch_fn=lambda account, place_id, job_id: launch_account(self.store, account, place_id, job_id),
+            launch_fn=lambda account, place_id, job_id, extra=None: launch_account(
+                self.store, account, place_id, job_id, extra=extra),
             list_pids_fn=_running_pids,
             kill_fn=kill_pid,
             log_fn=mi_log,
@@ -176,6 +177,11 @@ class App:
         self._boot_records, self._boot_clean = (
             self.sessions.load() if self.settings["restoreSessions"] else ([], True))
         self._restored = False
+
+        # Private server "armed" from Find server... > Private server. Memory only, never saved.
+        self.launch_extra: dict | None = None
+        self.launch_extra_place: int | None = None
+        self._arming = False
 
         self._build_ui()
         self._setup_tray()
@@ -321,6 +327,11 @@ class App:
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
         ttk.Button(game, text="Find server...", command=self.open_join_dialog).pack(anchor="w", pady=(6, 0))
+        self.armed_row = ttk.Frame(game)  # shown only while a private server is armed
+        ttk.Label(self.armed_row, text="Private server armed", foreground="#a15c00").pack(side="left")
+        ttk.Button(self.armed_row, text="Clear", width=6, command=self.clear_private).pack(side="left", padx=6)
+        self.place_var.trace_add("write", self._game_box_edited)
+        self.job_var.trace_add("write", self._game_box_edited)
         self.reload_places()
 
         act = ttk.LabelFrame(right, text="Actions", padding=8)
@@ -579,17 +590,44 @@ class App:
             messagebox.showwarning("Unknown game", "That is not a saved game, a place ID, or a roblox.com game link.")
         return place_id
 
+    # ---- private server (experimental) ----------------------------------
+    def arm_private(self, extra: dict, place_id: int) -> None:
+        """Called by the Find server dialog. The next launch from the Game box joins this private server."""
+        self._arming = True
+        try:
+            self.place_var.set(str(place_id))
+            self.job_var.set("")
+        finally:
+            self._arming = False
+        self.launch_extra, self.launch_extra_place = extra, place_id
+        self.armed_row.pack(anchor="w", pady=(6, 0))
+        mi_log(f"[ok] Private server armed for place {place_id}. Launch an account to join it.")
+
+    def clear_private(self) -> None:
+        if self.launch_extra is None:
+            return
+        self.launch_extra, self.launch_extra_place = None, None
+        self.armed_row.pack_forget()
+        mi_log("[ok] Private server cleared; launches go to public servers again.")
+
+    def _game_box_edited(self, *_args) -> None:
+        if not self._arming and self.launch_extra is not None:
+            self.clear_private()  # changing the game or server means "not that private server any more"
+
     def launch_accounts(self, accounts: list, place_id: int | None = None,
                         job_id: str | None = None) -> None:
         """`place_id` / `job_id` override the Game box (Launch group passes a saved default)."""
         if not accounts:
             messagebox.showinfo("Launch", "Select one or more accounts first.")
             return
+        extra = None
         if place_id is None:
             place_id = self.resolve_place(accounts)
             if place_id is None:
                 return
             job_id = self.job_var.get().strip() or None
+            if self.launch_extra is not None and place_id == self.launch_extra_place:
+                extra, job_id = self.launch_extra, None  # armed private server: never mixed with a job ID
         if job_id and len(job_id) < 8:
             mi_log("[!] That doesn't look like a job ID; ignoring it.")
             job_id = None
@@ -618,15 +656,15 @@ class App:
 
         for a in todo:
             self.launching[a.id] = "Queued..."
-        self.run_bg(self._launch_worker, todo, place_id, job_id)
+        self.run_bg(self._launch_worker, todo, place_id, job_id, extra)
 
-    def _launch_worker(self, accounts: list, place_id: int, job_id: str | None) -> None:
+    def _launch_worker(self, accounts: list, place_id: int, job_id: str | None, extra: dict | None = None) -> None:
         total = len(accounts)
         for n, a in enumerate(accounts, 1):
             self.launching[a.id] = "Launching..."
             self.set_status(f"Launching {a.username} ({n}/{total})...")
             try:
-                self.manager.launch(a, place_id, job_id)  # waits for the client + settle pause
+                self.manager.launch(a, place_id, job_id, extra=extra)  # waits for the client + settle pause
                 mi_log(f"[ok] {a.username} is running.")
             except LaunchError as exc:
                 mi_log(f"[!] {a.username}: {exc}")
