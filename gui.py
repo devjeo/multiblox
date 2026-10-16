@@ -43,6 +43,7 @@ if sys.platform != "win32":
 
 import autorejoin
 import diagnostics
+import groups
 import multi_instance
 from account_store import DATA_DIR, AccountStore, CookieError
 from autorejoin import RejoinManager
@@ -56,25 +57,11 @@ from multi_instance import (
 )
 from places import PlaceStore, fetch_place_name, parse_place_input
 from sessions import SessionStore, restore as restore_sessions
+from settings import DEFAULTS, Settings
 
 APP_TITLE = "Roblox Account Manager"
-SETTINGS_FILE = DATA_DIR / "settings.json"
 PERF_WARN_CLIENTS = 5   # warn before this many clients run at once
 LOG_MAX_LINES = 1000
-
-DEFAULTS = {
-    "autoEnableMultiInstance": True,
-    "closeToTray": True,
-    "rejoinCooldown": 8,         # autorejoin.REJOIN_COOLDOWN_SECONDS
-    "maxAttempts": 5,            # autorejoin.MAX_ATTEMPTS
-    "attemptWindowMinutes": 10,  # autorejoin.ATTEMPT_WINDOW_SECONDS / 60
-    "presencePollSeconds": 45,   # autorejoin.PRESENCE_POLL_SECONDS
-    "launchPauseSeconds": 6,     # autorejoin.SETTLE_SECONDS (pause after each launch)
-    "restoreSessions": True,     # re-attach to surviving clients on startup
-    "rejoinAfterCrash": True,    # relaunch dead ones after an unclean exit (auto-rejoin accounts only)
-    "mutexNames": "ROBLOX_singletonMutex",  # comma separated; change if a Roblox update renames them
-    "eventNames": "ROBLOX_singletonEvent",
-}
 
 STATE_LABELS = {
     "starting": ("Starting...", "busy"),
@@ -84,40 +71,6 @@ STATE_LABELS = {
     "gave_up": ("Gave up - use Resume", "bad"),
     "closed": ("Closed", "idle"),
 }
-
-
-# --------------------------------------------------------------------------
-# Settings
-# --------------------------------------------------------------------------
-class Settings(dict):
-    def __init__(self) -> None:
-        super().__init__(DEFAULTS)
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            for key, default in DEFAULTS.items():
-                if key in raw and type(raw[key]) is type(default):
-                    self[key] = raw[key]
-        except (OSError, ValueError):
-            pass
-        self.apply()
-
-    def save(self) -> None:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SETTINGS_FILE.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(dict(self), f, indent=2)
-        os.replace(tmp, SETTINGS_FILE)
-
-    def apply(self) -> None:
-        """Push the tunables into autorejoin (it reads these module globals live)."""
-        autorejoin.REJOIN_COOLDOWN_SECONDS = self["rejoinCooldown"]
-        autorejoin.MAX_ATTEMPTS = self["maxAttempts"]
-        autorejoin.ATTEMPT_WINDOW_SECONDS = self["attemptWindowMinutes"] * 60
-        autorejoin.PRESENCE_POLL_SECONDS = self["presencePollSeconds"]
-        autorejoin.SETTLE_SECONDS = self["launchPauseSeconds"]
-        split = lambda text: [n.strip() for n in text.split(",") if n.strip()]
-        multi_instance.set_singleton_names(split(self["mutexNames"]), split(self["eventNames"]))
 
 
 # --------------------------------------------------------------------------
@@ -242,8 +195,8 @@ class App:
     def _build_ui(self) -> None:
         root = self.root
         root.title(APP_TITLE)
-        root.geometry("980x640")
-        root.minsize(820, 520)
+        root.geometry("1100x660")
+        root.minsize(900, 520)
 
         style = ttk.Style()
         _fix_tk_tag_colors(style)
@@ -273,18 +226,32 @@ class App:
         # accounts (left)
         left = ttk.LabelFrame(body, text="Accounts", padding=6)
         left.grid(row=0, column=0, sticky="nsew")
-        cols = ("status", "game", "rejoin", "uptime")
+        self.group_filter = tk.StringVar(value=groups.ALL)
+        self._group_values: tuple = ()
+        bar = ttk.Frame(left)
+        bar.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Label(bar, text="Group:").pack(side="left")
+        self.group_cb = ttk.Combobox(bar, textvariable=self.group_filter, state="readonly", width=22,
+                                     values=[groups.ALL])
+        self.group_cb.pack(side="left", padx=(6, 0))
+        self.group_cb.bind("<<ComboboxSelected>>", lambda e: self._render_rows())
+
+        cols = ("group", "note", "status", "game", "rejoin", "uptime")
         self.tree = ttk.Treeview(left, columns=cols, selectmode="extended", show="tree headings")
         self.tree.heading("#0", text="Account")
+        self.tree.heading("group", text="Group")
+        self.tree.heading("note", text="Note")
         self.tree.heading("status", text="Status")
         self.tree.heading("game", text="Last game")
         self.tree.heading("rejoin", text="Auto-rejoin")
         self.tree.heading("uptime", text="Uptime")
-        self.tree.column("#0", width=150)
-        self.tree.column("status", width=150)
-        self.tree.column("game", width=200)
-        self.tree.column("rejoin", width=80, anchor="center")
-        self.tree.column("uptime", width=70, anchor="e")
+        self.tree.column("#0", width=130, minwidth=90)
+        self.tree.column("group", width=90, minwidth=60)
+        self.tree.column("note", width=150, minwidth=60)
+        self.tree.column("status", width=130, minwidth=90)
+        self.tree.column("game", width=160, minwidth=80)
+        self.tree.column("rejoin", width=75, minwidth=60, anchor="center")
+        self.tree.column("uptime", width=65, minwidth=55, anchor="e")
         for tag, color in (("ok", "#0a7d2c"), ("busy", "#b36b00"), ("bad", "#b00020"), ("idle", "#777777")):
             self.tree.tag_configure(tag, foreground=color)
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
@@ -300,6 +267,10 @@ class App:
         self.menu.add_command(label="Stop", command=self.stop_selected)
         self.menu.add_command(label="Resume", command=self.resume_selected)
         self.menu.add_command(label="Toggle auto-rejoin", command=self.toggle_selected_rejoin)
+        self.menu.add_separator()
+        self.menu.add_command(label="Set group...", command=self.set_group_selected)
+        self.menu.add_command(label="Edit note...", command=self.edit_note_selected)
+        self.menu.add_command(label="Use game box as group default", command=self.set_group_default)
         self.menu.add_separator()
         self.menu.add_command(label="Remove account", command=self.remove_selected)
 
@@ -333,6 +304,8 @@ class App:
             ("Toggle auto-rejoin (selected)", self.toggle_selected_rejoin),
         ):
             ttk.Button(act, text=text, command=cmd).pack(fill="x", pady=2)
+        self.group_btn = ttk.Button(act, text="Launch group", command=self.launch_group, state="disabled")
+        self.group_btn.pack(fill="x", pady=2)
 
         acc = ttk.LabelFrame(right, text="Manage", padding=8)
         acc.pack(fill="x", pady=(10, 0))
@@ -389,7 +362,26 @@ class App:
     def refresh(self) -> None:
         if self._closing:
             return
-        accounts = self.store.accounts
+        self._render_rows()
+        if self._restored:
+            self.sessions.save(self.manager.session_records(), clean=False)
+        self.root.after(1000, self.refresh)
+
+    def _sync_group_filter(self) -> None:
+        """Keeps the Group box in step with the groups that exist."""
+        values = (groups.ALL, *groups.names(self.store.accounts))
+        if values != self._group_values:
+            self._group_values = values
+            self.group_cb.configure(values=list(values))
+        current = self.group_filter.get()
+        if current != groups.ALL and not any(v.lower() == current.lower() for v in values[1:]):
+            self.group_filter.set(groups.ALL)  # the last member left that group
+        self.group_btn.configure(state="disabled" if self.group_filter.get() == groups.ALL else "normal")
+
+    def _render_rows(self) -> None:
+        """Redraws the account table. No timer here: refresh() schedules itself."""
+        self._sync_group_filter()
+        accounts = groups.filter_accounts(self.store.accounts, self.group_filter.get())
         existing = set(self.tree.get_children())
         for iid in existing - {a.id for a in accounts}:
             self.tree.delete(iid)
@@ -407,16 +399,13 @@ class App:
             if state == "running" and started:
                 secs = int(now - started)
                 uptime = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
-            values = (label, a.lastGameName or (a.savedPlaceId or ""),
+            values = (a.group, a.note, label, a.lastGameName or (a.savedPlaceId or ""),
                       "ON" if a.autoRejoinEnabled else "off", uptime)
             if a.id in existing:
                 self.tree.item(a.id, text=a.username, values=values, tags=(tag,))
             else:
                 self.tree.insert("", idx, iid=a.id, text=a.username, values=values, tags=(tag,))
         self.update_header()
-        if self._restored:
-            self.sessions.save(self.manager.session_records(), clean=False)
-        self.root.after(1000, self.refresh)
 
     def update_header(self) -> None:
         on = self.holder.active
@@ -560,14 +549,17 @@ class App:
             messagebox.showwarning("Unknown game", "That is not a saved game, a place ID, or a roblox.com game link.")
         return place_id
 
-    def launch_accounts(self, accounts: list) -> None:
+    def launch_accounts(self, accounts: list, place_id: int | None = None,
+                        job_id: str | None = None) -> None:
+        """`place_id` / `job_id` override the Game box (Launch group passes a saved default)."""
         if not accounts:
             messagebox.showinfo("Launch", "Select one or more accounts first.")
             return
-        place_id = self.resolve_place(accounts)
         if place_id is None:
-            return
-        job_id = self.job_var.get().strip() or None
+            place_id = self.resolve_place(accounts)
+            if place_id is None:
+                return
+            job_id = self.job_var.get().strip() or None
         if job_id and len(job_id) < 8:
             mi_log("[!] That doesn't look like a job ID; ignoring it.")
             job_id = None
@@ -631,6 +623,88 @@ class App:
                 mi_log(f"[ok] {a.username}: trying again.")
             else:
                 mi_log(f"[!] {a.username}: nothing to resume.")
+
+    # ---- groups and notes -----------------------------------------------
+    def launch_group(self) -> None:
+        group = self.group_filter.get()
+        members = groups.filter_accounts(self.store.accounts, group)
+        if group == groups.ALL or not members:
+            messagebox.showinfo("Launch group", "Pick a group in the Group box above the account list first.")
+            return
+        if self.place_var.get().strip():  # a game picked or typed in the Game box wins
+            self.launch_accounts(members)
+            return
+        target = groups.resolve_target(group, None, None, self.settings["groupGames"], members)
+        if target is None:
+            messagebox.showinfo(
+                "Launch group",
+                "No game is set for this group. Pick a game in the Game box, or right-click an account "
+                "in the group and choose 'Use game box as group default'.")
+            return
+        place_id, job_id = target
+        self.launch_accounts(members, place_id=place_id, job_id=job_id)
+
+    def set_group_selected(self) -> None:
+        accounts = self.selected_accounts()
+        if not accounts:
+            return
+        current = accounts[0].group if len({a.group for a in accounts}) == 1 else ""
+        value = simpledialog.askstring(
+            "Set group", "Group name (leave empty to clear):", initialvalue=current, parent=self.root)
+        if value is None:
+            return
+        try:
+            for a in accounts:
+                self.store.set_group(a, value)
+        except ValueError as exc:
+            messagebox.showwarning("Set group", str(exc), parent=self.root)
+            return
+        names = ", ".join(a.username for a in accounts)
+        mi_log(f"[ok] Group {accounts[0].group!r} set for: {names}" if accounts[0].group
+               else f"[ok] Group cleared for: {names}")
+        self._render_rows()
+
+    def edit_note_selected(self) -> None:
+        accounts = self.selected_accounts()
+        if not accounts:
+            return
+        current = accounts[0].note if len({a.note for a in accounts}) == 1 else ""
+        value = simpledialog.askstring(
+            "Edit note", "Note (leave empty to clear):", initialvalue=current, parent=self.root)
+        if value is None:
+            return
+        for a in accounts:
+            self.store.set_note(a, value)
+        self._render_rows()
+
+    def set_group_default(self) -> None:
+        """Saves the game in the Game box as the default for the selected account's group."""
+        accounts = self.selected_accounts()
+        group = accounts[0].group if accounts else ""
+        if not group:
+            messagebox.showinfo("Group default", "Right-click an account that is in a group "
+                                                 "(use 'Set group...' first).")
+            return
+        raw = self.place_var.get().strip()
+        if not raw:
+            messagebox.showinfo("Group default", "Pick a game in the Game box first.")
+            return
+        saved = self.places.find(raw)
+        place_id = saved.placeId if saved else parse_place_input(raw)[0]
+        if place_id is None:
+            messagebox.showwarning("Group default", "That is not a saved game, a place ID, or a roblox.com game link.")
+            return
+        job_id = self.job_var.get().strip() or None
+        if job_id and len(job_id) < 8:
+            job_id = None
+        games = {k: v for k, v in self.settings["groupGames"].items() if k.strip().lower() != group.lower()}
+        games[group] = {"placeId": place_id, "jobId": job_id}
+        self.settings["groupGames"] = games
+        try:
+            self.settings.save()
+        except OSError as exc:
+            messagebox.showwarning("Group default", f"Applied, but could not save: {exc}")
+        mi_log(f"[ok] Group {group!r} will launch place {place_id} when no game is picked.")
 
     # ---- auto-rejoin ----------------------------------------------------
     def toggle_selected_rejoin(self) -> None:
@@ -765,6 +839,7 @@ class App:
                 try:
                     results = diagnostics.run_all(
                         store=self.store, holder=self.holder, include_network=True,
+                        extras={"settings": self.settings},
                         progress=lambda m: self.ui(lambda m=m: show(m)))
                     report["text"] = diagnostics.format_report(results)
                 except Exception as exc:

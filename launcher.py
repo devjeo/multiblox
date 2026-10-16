@@ -25,6 +25,8 @@ Commands:
     autorejoin        turn auto-rejoin on/off for accounts (rejoins after a disconnect)
     stop              close an account's client on purpose (no auto-rejoin)
     resume            retry an account that auto-rejoin gave up on
+    setgroup          put an account in a group (then use 'group:<name>' wherever it asks which accounts)
+    setnote           set an account's note
     status            show running Roblox clients and auto-rejoin state
     quit              exit (releases multi-instance)
 """
@@ -42,6 +44,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import groups
 from account_store import Account, AccountStore
 from autorejoin import RejoinManager
 from places import PlaceStore, fetch_place_name, parse_place_input
@@ -183,7 +186,8 @@ def cmd_list(store: AccountStore) -> None:
         return
     for i, a in enumerate(store.accounts, 1):
         last = f" | last: {a.lastGameName or a.savedPlaceId}" if (a.lastGameName or a.savedPlaceId) else ""
-        print(f"  {i}. {a.username}{last}")
+        grp = f" [{a.group}]" if a.group else ""
+        print(f"  {i}. {a.username}{grp}{last}")
 
 
 def cmd_places(places: PlaceStore) -> None:
@@ -281,19 +285,39 @@ def _running_pids() -> set[int]:
     return {pid for pid, _ in find_roblox_processes()}
 
 
-def _select_accounts(store: AccountStore, prompt: str) -> list[Account]:
-    raw = input(prompt).strip().lower()
-    if raw in ("all", "a"):
-        return list(store.accounts)
+def parse_selection(store: AccountStore, raw: str) -> tuple[list[Account], list[str]]:
+    """Turns '1,3', 'alice,bob', 'all' or 'group:farm' (mix them with commas) into
+    (accounts, problems). Pure: it prints nothing, so it can be tested."""
+    raw = raw.strip()
+    if raw.lower() in ("all", "a"):
+        return list(store.accounts), []
     chosen: list[Account] = []
+    problems: list[str] = []
     for part in raw.split(","):
-        if not part.strip():
+        part = part.strip()
+        if not part:
+            continue
+        if part.lower().startswith("group:"):
+            name = part[6:].strip()
+            members = groups.filter_accounts(store.accounts, name) if name else []
+            if not members:
+                problems.append(f"No accounts in group '{name}'.")
+            for acc in members:
+                if acc not in chosen:
+                    chosen.append(acc)
             continue
         acc = store.find(part)
         if acc and acc not in chosen:
             chosen.append(acc)
         elif not acc:
-            print(f"[!] Skipping unknown account '{part.strip()}'.")
+            problems.append(f"Skipping unknown account '{part}'.")
+    return chosen, problems
+
+
+def _select_accounts(store: AccountStore, prompt: str) -> list[Account]:
+    chosen, problems = parse_selection(store, input(prompt))
+    for problem in problems:
+        print(f"[!] {problem}")
     return chosen
 
 
@@ -302,7 +326,7 @@ def cmd_joinall(store: AccountStore, places: PlaceStore, manager: RejoinManager)
         print("No accounts saved.")
         return
     cmd_list(store)
-    chosen = _select_accounts(store, "Which accounts? (e.g. 1,3 - or 'all'): ")
+    chosen = _select_accounts(store, "Which accounts? (e.g. 1,3 - 'all' - or group:farm): ")
     if not chosen:
         return
     place_id = ask_place(chosen[0].savedPlaceId, places)
@@ -325,7 +349,7 @@ def cmd_autorejoin(store: AccountStore, manager: RejoinManager) -> None:
         return
     for i, a in enumerate(store.accounts, 1):
         print(f"  {i}. {a.username} - auto-rejoin {'ON' if a.autoRejoinEnabled else 'off'}")
-    chosen = _select_accounts(store, "Which accounts? (e.g. 1,3 - or 'all'): ")
+    chosen = _select_accounts(store, "Which accounts? (e.g. 1,3 - 'all' - or group:farm): ")
     if not chosen:
         return
     mode = input("Turn auto-rejoin on or off? ").strip().lower()
@@ -358,6 +382,29 @@ def cmd_resume(store: AccountStore, manager: RejoinManager) -> None:
     account = _pick_one(store, "Resume which account (number or username)? ")
     if account:
         print("[ok] Trying again." if manager.resume(account) else "Nothing to resume for that account.")
+
+
+def cmd_setgroup(store: AccountStore) -> None:
+    account = _pick_one(store, "Which account (number or username)? ")
+    if not account:
+        return
+    current = f" (now: {account.group})" if account.group else ""
+    value = input(f"Group name for {account.username}{current} - empty clears it: ")
+    try:
+        store.set_group(account, value)
+    except ValueError as exc:
+        print(f"[!] {exc}")
+        return
+    print(f"[ok] {account.username}: group {account.group!r}." if account.group
+          else f"[ok] {account.username}: group cleared.")
+
+
+def cmd_setnote(store: AccountStore) -> None:
+    account = _pick_one(store, "Which account (number or username)? ")
+    if not account:
+        return
+    store.set_note(account, input(f"Note for {account.username} - empty clears it: "))
+    print("[ok] Note saved." if account.note else "[ok] Note cleared.")
 
 
 def cmd_status(manager: RejoinManager) -> None:
@@ -432,13 +479,17 @@ def main() -> None:
                 cmd_stop(store, manager)
             elif cmd == "resume":
                 cmd_resume(store, manager)
+            elif cmd == "setgroup":
+                cmd_setgroup(store)
+            elif cmd == "setnote":
+                cmd_setnote(store)
             elif cmd == "status":
                 cmd_status(manager)
             elif cmd in ("quit", "exit", "q"):
                 break
             elif cmd:
                 print("Commands: list, addplace, places, removeplace, launch, joinall, "
-                      "autorejoin, stop, resume, status, quit")
+                      "autorejoin, stop, resume, setgroup, setnote, status, quit")
     finally:
         manager.stop()
         watcher.stop()

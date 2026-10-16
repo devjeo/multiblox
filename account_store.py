@@ -47,6 +47,9 @@ from pathlib import Path
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "RobloxAccountManager"
 DATA_FILE = DATA_DIR / "accounts.json"
 DATA_VERSION = 1
+GROUP_MAX_LENGTH = 40
+NOTE_MAX_LENGTH = 200
+RESERVED_GROUP_NAMES = {"all groups"}  # the group filter's "show everything" entry
 
 AUTH_URL = "https://users.roblox.com/v1/users/authenticated"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobloxAccountManager/0.2"
@@ -179,6 +182,8 @@ class Account:
     lastGameName: str | None = None
     autoRejoinEnabled: bool = False
     createdAt: str = field(default_factory=_now)
+    group: str = ""  # optional label to launch / filter accounts together
+    note: str = ""   # free-form note shown in the account list
 
 
 class AccountStore:
@@ -253,6 +258,19 @@ class AccountStore:
 
     def remove(self, account: Account) -> None:
         self.accounts = [a for a in self.accounts if a.id != account.id]
+        self.save()
+
+    def set_group(self, account: Account, group: str) -> None:
+        """Sets (or clears, with an empty string) the account's group label."""
+        value = " ".join(group.split())[:GROUP_MAX_LENGTH]
+        if value.lower() in RESERVED_GROUP_NAMES:
+            raise ValueError(f"'{value}' is reserved. Pick another group name.")
+        account.group = value
+        self.save()
+
+    def set_note(self, account: Account, note: str) -> None:
+        """Sets (or clears) the account's note. Long notes are cut to NOTE_MAX_LENGTH."""
+        account.note = note.strip()[:NOTE_MAX_LENGTH]
         self.save()
 
 

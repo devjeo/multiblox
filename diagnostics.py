@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import groups
 from account_store import DATA_DIR
 from safelog import redact
 
@@ -272,10 +273,37 @@ def check_accounts(store, include_network):
     return results
 
 
+def check_groups(store, settings=None):
+    if store is None:
+        return _skip("Groups", "not available")
+    results = []
+    members = {n: len(groups.filter_accounts(store.accounts, n)) for n in groups.names(store.accounts)}
+    ungrouped = sum(1 for a in store.accounts if not (a.group or "").strip())
+    if members:
+        listing = ", ".join(f"{n}: {c}" for n, c in members.items())
+        if ungrouped:
+            listing += f", (no group): {ungrouped}"
+        results.append(_info("Groups", listing))
+    else:
+        results.append(_info("Groups", "no account is in a group"))
+    raw = settings.get("groupGames") if settings is not None else None
+    if raw:
+        defaults, problems = groups.normalize_group_games(raw)
+        for problem in problems:
+            results.append(_warn("Group game", problem))
+        for key in defaults:
+            if not groups.filter_accounts(store.accounts, key):
+                results.append(_warn("Group game", f"'{key}' has a saved game but no account is in that group"))
+    return results
+
+
 # --------------------------------------------------------------------------
 # Runner + report
 # --------------------------------------------------------------------------
-def run_all(store=None, holder=None, include_network: bool = True, progress=None) -> list[Result]:
+def run_all(store=None, holder=None, include_network: bool = True, progress=None,
+            extras=None) -> list[Result]:
+    """`extras`: optional dict of extra objects for newer checks, e.g. {'settings': Settings}."""
+    extras = extras or {}
     steps = [
         ("Python", check_python), ("Administrator", check_admin), ("Data folder", check_data_dir),
         ("Saved files", check_data_files), ("Encryption", check_dpapi), ("Roblox install", check_roblox_install),
@@ -284,7 +312,8 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
     if include_network:
         steps.append(("Roblox web endpoints", check_network))
     steps += [("Multi-instance", lambda: check_multi_instance(holder)),
-              ("Accounts", lambda: check_accounts(store, include_network))]
+              ("Accounts", lambda: check_accounts(store, include_network)),
+              ("Groups", lambda: check_groups(store, extras.get("settings")))]
     results: list[Result] = []
     for label, fn in steps:
         if progress:
