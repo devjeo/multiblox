@@ -53,6 +53,9 @@ DEFAULTS = {
     "layoutColumns": 3,
     "layoutGap": 4,
     "layoutAutoTile": False,
+    # Scheduler (see scheduler.py)
+    "schedulerEnabled": True,
+    "scheduleMissedWindowMinutes": 30,   # a run missed while asleep/closed still fires within this long
 }
 
 

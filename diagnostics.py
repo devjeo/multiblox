@@ -96,7 +96,7 @@ def check_data_dir():
 
 def check_data_files():
     results = []
-    for name in ("accounts.json", "places.json", "settings.json", "sessions.json", "secrets.json",
+    for name in ("accounts.json", "places.json", "settings.json", "sessions.json", "secrets.json", "schedules.json",
                  "resource_backup.json"):
         path = DATA_DIR / name
         if not path.exists():
@@ -398,6 +398,38 @@ def check_layout(settings=None, api=None, last_tile=None):
     return results
 
 
+def check_scheduler(settings=None, sched=None):
+    """schedules.json parses, every rule's target resolves, the missed-run window is sane, and when
+    the scheduler last ticked and each rule last ran."""
+    if sched is None:
+        return _skip("Scheduler", "not available")
+    import scheduler as sc
+    results = []
+    for problem in getattr(sched.store, "problems", []):
+        results.append(_warn("schedules.json", problem))
+    rules = sched.rules
+    on = settings.get("schedulerEnabled", True) if settings is not None else True
+    results.append(_info("Scheduler", f"{len(rules)} rule(s), {sum(1 for r in rules if r.enabled)} enabled; "
+                                      f"{'running' if on else 'turned OFF in Settings'}"))
+    window = settings.get("scheduleMissedWindowMinutes") if settings is not None else None
+    if window is not None and not (isinstance(window, int) and 1 <= window <= 1440):
+        results.append(_warn("Schedule window", f"{window!r} is outside 1-1440 minutes; the nearest valid value is used"))
+    accounts = sched.manager.store.accounts
+    for rule in rules:
+        label = f"Rule {sc.Scheduler.describe(rule)}"
+        if not sc.accounts_for(rule, accounts):
+            results.append(_warn(label, f"'{rule.target}' does not match any {rule.targetType}"))
+        elif rule.action == "start" and sc.resolve_game(
+                rule, accounts, settings.get("groupGames") if settings is not None else {}) is None:
+            results.append(_warn(label, "has no game (set one on the rule or a group default)"))
+        else:
+            results.append(_ok(label, f"last run {rule.lastRun or 'never'}" + (
+                "" if rule.enabled else " (turned off)")))
+    tick = sched.last_tick
+    results.append(_info("Scheduler last tick", tick.isoformat(timespec="seconds") if tick else "not ticked yet"))
+    return results
+
+
 def check_join_tools(include_network: bool = True):
     """games.roblox.com (the server finder's source), users.roblox.com (friend lookup) and the
     results of the last finder run and the last friend lookup."""
@@ -472,6 +504,7 @@ def run_all(store=None, holder=None, include_network: bool = True, progress=None
               ("Notifications", lambda: check_notifications(extras.get("settings"), extras.get("notifier"))),
               ("Join tools", lambda: check_join_tools(include_network)),
               ("Resource saver", lambda: check_resourcesaver(extras.get("settings"))),
+              ("Scheduler", lambda: check_scheduler(extras.get("settings"), extras.get("scheduler"))),
               ("Window layout", lambda: check_layout(extras.get("settings"), extras.get("winapi"),
                                                      extras.get("last_tile")))]
     results: list[Result] = []

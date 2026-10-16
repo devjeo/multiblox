@@ -35,6 +35,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -48,6 +49,7 @@ import groups
 import multi_instance
 import notify_discord
 import resourcesaver
+import scheduler
 import winapi
 import winlayout
 import secrets_store
@@ -176,6 +178,17 @@ class App:
             on_ready_fn=self._on_client_ready,
         )
         self.manager.start()
+
+        # Scheduler (rules in schedules.json). It starts ticking after session restore (see _restore).
+        self.rule_store = scheduler.RuleStore()
+        self.scheduler = scheduler.Scheduler(
+            self.rule_store.load(), self.rule_store, self.manager, self._launch_worker, datetime.now, mi_log,
+            lambda: self.settings["scheduleMissedWindowMinutes"],
+            group_games_fn=lambda: self.settings["groupGames"],
+            multi_instance_fn=lambda: self.holder.active,
+            enabled_fn=lambda: self.settings["schedulerEnabled"] and not self._closing)
+        for problem in self.rule_store.problems:
+            mi_log(f"[!] Schedule: {problem}.")
 
         # Crash/restart recovery. Records are loaded now, restored after multi-instance is on
         # (see startup). Nothing is written to sessions.json until that has happened.
@@ -327,6 +340,7 @@ class App:
         self.ar_btn = ttk.Button(top, width=20, command=self.toggle_all_rejoin)
         self.ar_btn.pack(side="left", padx=6)
         ttk.Button(top, text="Settings...", command=self.open_settings).pack(side="right")
+        ttk.Button(top, text="Schedules...", command=self.open_schedules).pack(side="right", padx=6)
         ttk.Button(top, text="Diagnostics...", command=self.open_diagnostics).pack(side="right", padx=6)
         if not _is_admin():
             ttk.Label(top, foreground="#b36b00",
@@ -562,6 +576,20 @@ class App:
                    f"{c['dropped']} skipped" + ("" if self._boot_clean else " (last run did not exit cleanly)."))
         self._boot_records = []
         self._restored = True
+        self._scheduler_tick()  # once now (catches runs missed while closed), then every 30 s
+
+    def _scheduler_tick(self) -> None:
+        if self._closing:
+            return
+        try:
+            self.scheduler.tick()
+        except Exception as exc:
+            mi_log(f"[!] Schedule: tick failed: {exc!r}")
+        self.root.after(30000, self._scheduler_tick)
+
+    def open_schedules(self) -> None:
+        from schedule_window import ScheduleWindow  # imported on demand (PyInstaller: see the spec file)
+        ScheduleWindow(self)
 
     def on_close(self) -> None:
         if self.tray and self.settings["closeToTray"]:
@@ -588,6 +616,7 @@ class App:
         if self._restored:
             self.sessions.save(self.manager.session_records(), clean=True)  # a deliberate quit
         self.manager.stop()
+        self.scheduler.stop()
         self.notifier.stop()
         self.watcher.stop()
         self.holder.disable()
@@ -1008,7 +1037,8 @@ class App:
                     results = diagnostics.run_all(
                         store=self.store, holder=self.holder, include_network=True,
                         extras={"settings": self.settings, "notifier": self.notifier,
-                                "winapi": self.winapi(), "last_tile": self.last_tile},
+                                "winapi": self.winapi(), "last_tile": self.last_tile,
+                                "scheduler": self.scheduler},
                         progress=lambda m: self.ui(lambda m=m: show(m)))
                     report["text"] = diagnostics.format_report(results)
                 except Exception as exc:
@@ -1209,6 +1239,21 @@ class App:
                         variable=auto_tile_var).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
+        # ---- scheduler
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(frm, text="Scheduler", font=("Segoe UI", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        sched_on_var = tk.BooleanVar(value=self.settings["schedulerEnabled"])
+        ttk.Checkbutton(frm, text="Run schedules (Schedules... button)", variable=sched_on_var).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        missed_var = tk.IntVar(value=self.settings["scheduleMissedWindowMinutes"])
+        ttk.Label(frm, text="Still run a missed schedule for (minutes)").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Spinbox(frm, from_=1, to=1440, textvariable=missed_var, width=6).grid(row=row, column=1, padx=(12, 0))
+        row += 1
+
         # ---- performance (resource saver)
         ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
         row += 1
@@ -1290,6 +1335,15 @@ class App:
             self.settings["layoutMonitor"] = max(0, monitor_labels.index(monitor_var.get())
                                                  if monitor_var.get() in monitor_labels else 0)
             self.settings["layoutAutoTile"] = bool(auto_tile_var.get())
+            try:
+                missed = int(missed_var.get())
+                if not 1 <= missed <= 1440:
+                    raise ValueError
+            except (ValueError, tk.TclError):
+                messagebox.showwarning("Settings", "Missed schedule window: use 1-1440 minutes.", parent=win)
+                return
+            self.settings["schedulerEnabled"] = bool(sched_on_var.get())
+            self.settings["scheduleMissedWindowMinutes"] = missed
             self.settings["performanceProfile"] = profile_var.get()
             self.settings["applyProfileBeforeLaunch"] = bool(apply_before_var.get())
             for key, var in names.items():
