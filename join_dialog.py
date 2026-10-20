@@ -1,481 +1,209 @@
 """
-Join tools window. Tabs: "Server finder" (Feature C1), "Join friend" and "Join user" (Feature C2) and
-"Private server" (Feature C3: pick a game and see your own and your friends' private servers).
+Join tools, as tabs of the main window's left panel (no separate window any more):
 
-Imported only when the "Find server..." button is pressed, so gui.py stays light.
-All network work runs through app.run_bg and results come back through app.ui.
+  Player   (join_panel.py)           look up / pick a player and join their server
+  Finder   (this file)               list a game's public servers; click one to join it
+  Private  (this file)               your own and your friends' private servers (experimental)
+  Hopper   (this file)               move accounts to a new server now or every N minutes
+  History  (server_history_panel.py) every server any account got into
+
+This file builds the Finder, Private and Hopper tabs into the notebook it is given. Joining a friend
+or any user lives in join_panel.py. All network work runs through app.run_bg and results come back
+through app.ui. The tabs scroll when the window is short, so nothing is ever cut off; the window and
+its panels have a fixed size.
 """
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-import friends
+import ui_style
 from game_picker import GamePicker
-from multi_instance import log as mi_log
 import private_links
 import private_servers as ps
 import server_finder as sf
+import server_hopper as sh
 from places import parse_place_input
 
 
-class UserTab:
-    """The two 'join a person' tabs share this code.
-
-    mode "friend": the account's ONLINE FRIENDS are listed; ONE account joins. Choosing this tab
-                   reduces the main window's selection to its top account and locks it, so the
-                   account whose friends you see is always the account that joins.
-    mode "public": look up ANY user by username / ID and see whether they can be joined. Every
-                   selected account that Roblox actually lets into that server joins.
-    """
-
-    def __init__(self, dlg: "JoinDialog", parent: ttk.Frame, mode: str) -> None:
-        self.dlg, self.app, self.mode = dlg, dlg.app, mode
-        self.busy = False
-        self.user: friends.User | None = None
-        self.asker = None            # friend mode: the locked account
-        self.entries: dict[str, friends.FriendEntry] = {}
-        self.loaded = False
-        self.parent = parent
-        self._build(parent)
-
-    # ---- UI -------------------------------------------------------------
-    def _build(self, parent: ttk.Frame) -> None:
-        if self.mode == "friend":
-            text = ("Pick one of your online friends and press Join. Only ONE account joins: the top selected "
-                    "account in the main window, which is locked while this tab is open. Roblox only shows a "
-                    "server if the friend's privacy settings allow it.")
-        else:
-            text = ("Look up any Roblox user, friend or not, to see if you can join them. Every account selected "
-                    "in the main window that Roblox lets into their server joins; the first selected account "
-                    "is used to ask Roblox. Roblox only shows a server if the user's privacy settings allow it.")
-        ttk.Label(parent, text=text, style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w")
-
-        if self.mode == "friend":
-            acct = ttk.Frame(parent)
-            acct.pack(fill="x", pady=(8, 0))
-            self.asker_var = tk.StringVar(value="Account: none selected")
-            ttk.Label(acct, textvariable=self.asker_var, style="Heading.TLabel").pack(side="left")
-            self.change_btn = ttk.Button(acct, text="Change account", command=self.change_account)
-            self.change_btn.pack(side="left", padx=10)
-            top = ttk.Frame(parent)
-            top.pack(fill="x", pady=(8, 0))
-            self.refresh_btn = ttk.Button(top, text="Refresh online friends", command=self.load_friends)
-            self.refresh_btn.pack(side="left")
-            self.count_var = tk.StringVar(value="")
-            ttk.Label(top, textvariable=self.count_var, style="Muted.TLabel").pack(side="left", padx=10)
-            self.tree = ttk.Treeview(parent, columns=("name", "status"), show="headings",
-                                     selectmode="browse", height=8)
-            for col, label, width in (("name", "Online friend", 260), ("status", "Status", 260)):
-                self.tree.heading(col, text=label)
-                self.tree.column(col, width=width, anchor="w")
-            sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
-            self.tree.configure(yscrollcommand=sb.set)
-            body = ttk.Frame(parent)
-            body.pack(fill="both", expand=True, pady=6)
-            self.tree.pack(in_=body, side="left", fill="both", expand=True)
-            sb.pack(in_=body, side="left", fill="y")
-            self.tree.lift()   # created before `body`, so it would sit under it and be invisible
-            sb.lift()
-            self.tree.bind("<<TreeviewSelect>>", lambda e: self._picked())
-            self.tree.bind("<Double-1>", lambda e: self.join() if self.join_btn["state"] == "normal" else None)
-        else:
-            row = ttk.Frame(parent)
-            row.pack(fill="x", pady=(10, 0))
-            ttk.Label(row, text="Username or ID:").pack(side="left")
-            self.query_var = tk.StringVar()
-            entry = ttk.Entry(row, textvariable=self.query_var, width=30)
-            entry.pack(side="left", padx=(6, 8))
-            entry.bind("<Return>", lambda e: self.lookup())
-            self.lookup_btn = ttk.Button(row, text="Look up", command=self.lookup)
-            self.lookup_btn.pack(side="left")
-
-        self.name_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self.name_var, style="Heading.TLabel").pack(anchor="w", pady=(10, 0))
-        self.status_var = tk.StringVar(value=(
-            "Select an account in the main window, then press Refresh online friends." if self.mode == "friend"
-            else "Type a username (or a user ID / profile link) and press Look up."))
-        ttk.Label(parent, textvariable=self.status_var, wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
-
-        bottom = ttk.Frame(parent)
-        bottom.pack(side="bottom", fill="x")
-        ttk.Button(bottom, text="Close", command=self.dlg.destroy).pack(side="right")
-        self.join_btn = ttk.Button(bottom, text="Join", command=self.join, state="disabled")
-        self.join_btn.pack(side="right", padx=6)
-
-    # ---- small helpers --------------------------------------------------
-    def _set(self, name: str, status: str, joinable: bool) -> None:
-        try:
-            self.name_var.set(name)
-            self.status_var.set(status)
-            self.join_btn.configure(state="normal" if joinable else "disabled")
-        except tk.TclError:  # the window was closed while a lookup was running
-            pass
-
-    def _done(self) -> None:
-        self.busy = False
-        for name in ("lookup_btn", "refresh_btn"):
-            btn = getattr(self, name, None)
-            if btn is not None:
-                try:
-                    btn.configure(state="normal")
-                except tk.TclError:
-                    pass
-
-    def _busy_on(self) -> None:
-        self.busy = True
-        for name in ("lookup_btn", "refresh_btn"):
-            btn = getattr(self, name, None)
-            if btn is not None:
-                btn.configure(state="disabled")
-
-    def _presence(self, account, user: friends.User):
-        """Runs in a worker. The cookie lives only inside this call."""
-        cookie = self.app.store.get_cookie(account)
-        try:
-            return friends.get_presence(cookie, user.id)
-        finally:
-            del cookie
-
-    # ---- friend mode: lock the account, list online friends ----------------
-    def activate(self) -> None:
-        """The Join friend tab was opened."""
-        if self.asker is None and self.app.selected_accounts():
-            self.load_friends()
-
-    def deactivate(self) -> None:
-        """Left the tab or closed the window: give the main list back."""
-        if self.mode != "friend":
-            return
-        self.asker = None
-        self.app.unlock_selection()
-        try:
-            self.asker_var.set("Account: none selected")
-        except (tk.TclError, AttributeError):
-            pass
-
-    def _lock_top_account(self):
-        """Reduce the selection to its top account and lock the list to it."""
-        if self.asker is not None:
-            return self.asker
-        accounts = self.app.selected_accounts()
-        if not accounts:
-            messagebox.showinfo("Join friend", "Select an account in the main window first. It is the account "
-                                               "that joins, and whose friends are listed.", parent=self.dlg)
-            return None
-        self.asker = accounts[0]
-        self.app.lock_selection(accounts[0])   # also unselects the others
-        self.asker_var.set(f"Account: {accounts[0].username}")
-        return accounts[0]
-
-    def change_account(self) -> None:
-        if self.busy:
-            return
-        self.deactivate()
-        self.loaded = False
-        self.entries = {}
-        self.user = None
-        try:
-            self.tree.delete(*self.tree.get_children())
-        except tk.TclError:
-            pass
-        self.count_var.set("")
-        self._set("", "Select another account in the main window, then press Refresh online friends.", False)
-
-    def load_friends(self) -> None:
-        if self.busy:
-            return
-        asker = self._lock_top_account()
-        if asker is None:
-            return
-        self._busy_on()
-        self.count_var.set("Loading...")
-
-        def work() -> None:
-            try:
-                cookie = self.app.store.get_cookie(asker)
-                try:
-                    entries = friends.online_friends(cookie, asker.userId)
-                finally:
-                    del cookie
-                friends.record_result(None, f"listed {len(entries)} online")
-                self.app.ui(lambda: self._show_friends(asker, entries))
-            except Exception as exc:
-                text = friends.describe_error(exc)
-                friends.record_result(None, "error", error=text)
-                self.app.ui(lambda: self._friends_failed(text))
-        self.app.run_bg(work)
-
-    def _friends_failed(self, text: str) -> None:
-        self._done()
-        try:
-            self.count_var.set("")
-            self.status_var.set(text)
-        except tk.TclError:
-            pass
-
-    def _show_friends(self, asker, entries: list) -> None:
-        self._done()
-        try:
-            self.tree.delete(*self.tree.get_children())
-        except tk.TclError:
-            return
-        self.loaded = True
-        self.entries = {str(e.user.id): e for e in entries}
-        for e in entries:
-            self.tree.insert("", "end", iid=str(e.user.id), values=(e.title, e.status))
-        joinable = sum(1 for e in entries if e.joinable)
-        self.count_var.set(f"{asker.username}: {len(entries)} online, {joinable} joinable")
-        self._set("", "Pick a friend from the list." if entries else
-                  "None of this account's friends are online right now.", False)
-
-    def _picked(self) -> None:
-        sel = self.tree.selection()
-        entry = self.entries.get(sel[0]) if sel else None
-        if entry is None:
-            return
-        self.user = entry.user
-        self._set(entry.title, friends.describe_presence(entry.presence), entry.joinable)
-
-    # ---- public mode: look anyone up ---------------------------------------
-    def lookup(self) -> None:
-        if self.busy:
-            return
-        accounts = self.app.selected_accounts()
-        if not accounts:
-            messagebox.showinfo("Join user", "Select an account in the main window first. It is used to ask "
-                                             "Roblox where the user is.", parent=self.dlg)
-            return
-        query = self.query_var.get().strip()
-        if not query:
-            return
-        asker = accounts[0]
-        self._busy_on()
-        self.user = None
-        self._set("", "Looking up...", False)
-
-        def work() -> None:
-            user = None
-            try:
-                user = friends.find_user(query)
-                if user is None:
-                    friends.record_result(None, "no such user")
-                    self.app.ui(lambda: (self._done(), self._set("", "No Roblox user found for that name or ID.", False)))
-                    return
-                presence = self._presence(asker, user)
-                target = friends.resolve_join_target(presence)
-                friends.record_result(user.id, "joinable" if target else "unavailable")
-                text = friends.describe_presence(presence)
-                title = user.name if not user.display_name or user.display_name == user.name \
-                    else f"{user.display_name} (@{user.name})"
-
-                def show() -> None:
-                    self._done()
-                    self.user = user
-                    self._set(title, text, target is not None)
-                self.app.ui(show)
-            except Exception as exc:
-                text = friends.describe_error(exc)
-                friends.record_result(user.id if user else None, "error", error=text)
-                self.app.ui(lambda: (self._done(), self._set("", text, False)))
-        self.app.run_bg(work)
-
-    # ---- join ---------------------------------------------------------------
-    def join(self) -> None:
-        """Asks Roblox again (the user may have moved), then launches there."""
-        user = self.user
-        if user is None or self.busy:
-            return
-        if self.mode == "friend":
-            accounts = [self.asker] if self.asker is not None else []
-        else:
-            accounts = self.app.selected_accounts()
-        if not accounts:
-            messagebox.showinfo("Join", "Select the account to launch in the main window first.", parent=self.dlg)
-            return
-        asker = accounts[0]
-        self._busy_on()
-        self.join_btn.configure(state="disabled")
-        self.status_var.set("Checking where they are now...")
-
-        def work() -> None:
-            try:
-                presence = self._presence(asker, user)
-                target = friends.resolve_join_target(presence)
-                if target is None:
-                    friends.record_result(user.id, "unavailable")
-                    text = friends.describe_presence(presence)
-                    self.app.ui(lambda: (self._done(), self._set(
-                        self.name_var.get(), "They are no longer joinable. " + text, False)))
-                    return
-                place_id, job_id = target
-                allowed, skipped = [asker], []
-                for other in accounts[1:]:      # public mode only: each extra account must be let in too
-                    try:
-                        p = self._presence(other, user)
-                        ok = friends.resolve_join_target(p) == target
-                        why = "" if ok else friends.describe_presence(p)
-                    except Exception as exc:
-                        ok, why = False, friends.describe_error(exc)
-                    if ok:
-                        allowed.append(other)
-                    else:
-                        skipped.append(other)
-                        mi_log(f"[!] {other.username}: skipped - cannot join {user.name}'s server. {why}")
-                friends.record_result(user.id, "joined")
-                self.app.ui(lambda: self._launch(allowed, place_id, job_id, len(skipped)))
-            except Exception as exc:
-                text = friends.describe_error(exc)
-                friends.record_result(user.id, "error", error=text)
-                self.app.ui(lambda: (self._done(), self._set(self.name_var.get(), text, False)))
-        self.app.run_bg(work)
-
-    def _launch(self, accounts: list, place_id: int, job_id: str, skipped: int) -> None:
-        self._done()
-        # strict: an account that does not get into this exact server within ~75 s is closed,
-        # never retried into another server.
-        self.app.launch_accounts(accounts, place_id, job_id, strict=True)
-        note = f" ({skipped} account(s) skipped, see the log)" if skipped else ""
-        self.app.set_status(f"Joining that user's server with {len(accounts)} account(s)...{note}")
-        self.dlg.destroy()
+def short_id(job_id: str) -> str:
+    return job_id if len(job_id) <= 13 else job_id[:8] + "…" + job_id[-4:]
 
 
-class JoinDialog(tk.Toplevel):
-    def __init__(self, app) -> None:
-        super().__init__(app.root)
+class JoinTools:
+    def __init__(self, app, nb: ttk.Notebook, wrap: int) -> None:
         self.app = app
-        self.title("Join tools")
-        self.geometry("700x680")
-        self.minsize(560, 560)
-        self.transient(app.root)
+        self.nb = nb            # the left panel's notebook; the Player and History tabs are added by the main window
+        self.wrap = wrap        # width, in px, that long texts wrap to
         self._busy = False
+        self._joining = False
         self._place_id: int | None = None
         self._servers: dict[str, sf.Server] = {}
-
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=8)
-        finder = ttk.Frame(self.nb, padding=10)
-        self.nb.add(finder, text="Server finder")
-        self._build_finder(finder)
-
-        friend = ttk.Frame(self.nb, padding=10)
-        self.nb.add(friend, text="Join friend")
-        self.friend_tab = UserTab(self, friend, "friend")
-
-        public = ttk.Frame(self.nb, padding=10)
-        self.nb.add(public, text="Join user")
-        self.public_tab = UserTab(self, public, "public")
-        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._tab_changed())
-
         self._ps_busy = False
         self._ps_place_id: int | None = None   # the game the list on screen belongs to
         self._ps_found: list = []              # PrivateServer objects (codes live in memory only)
         self._ps_rows: dict[str, ps.PrivateServer] = {}
-        private = ttk.Frame(self.nb, padding=10)
-        self.nb.add(private, text="Private server")
-        self._build_private(private)
+        self._hop_job = None
 
-    # ---- UI -------------------------------------------------------------
+        self._build_finder(app.make_join_tab("Finder"))
+        self._build_private(app.make_join_tab("Private"))
+        self._build_hopper(app.make_join_tab("Hopper"))
+        nb.bind("<<NotebookTabChanged>>", lambda e: self._tab_changed(), add="+")
+        self._hop_job = nb.after(500, self._hop_tick)   # not at once: the main window is still being built
+
+    # ---- small helpers ----------------------------------------------------
+    def _note(self, parent, text: str) -> None:
+        lab = ttk.Label(parent, text=text, style="CardMuted.TLabel", wraplength=self.wrap, justify="left")
+        lab.pack(anchor="w")
+        ui_style.autowrap(lab, parent)
+
+    def _line(self, parent, textvariable, pady=(6, 6)) -> ttk.Label:
+        lab = ttk.Label(parent, textvariable=textvariable, style="Card.TLabel", wraplength=self.wrap, justify="left")
+        lab.pack(anchor="w", fill="x", pady=pady)
+        ui_style.autowrap(lab, parent)
+        return lab
+
+    def _table(self, parent, columns, height: int) -> ttk.Treeview:
+        """A table with a scrollbar and fixed column widths (headings cannot be dragged).
+        columns: (id, heading, width, anchor, stretch)."""
+        box = ttk.Frame(parent, style="Surface.TFrame")
+        box.pack(fill="x", pady=(8, 0))
+        tree = ttk.Treeview(box, columns=[c[0] for c in columns], show="headings", selectmode="browse", height=height)
+        for col, text, width, anchor, stretch in columns:
+            tree.heading(col, text=text, anchor="w" if anchor == "w" else "center")
+            tree.column(col, width=width, minwidth=24, anchor=anchor, stretch=stretch)
+        sb = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="x", expand=True)
+        sb.pack(side="left", fill="y")
+        ui_style.lock_columns(tree)
+        return tree
+
+    # ---- Finder tab ---------------------------------------------------------
     def _build_finder(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Looks at the game in the main window's Game box (or the selected account's "
-                               "last game) and lists its public servers.",
-                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w")
-        row = ttk.Frame(parent)
+        self._note(parent, "Lists the public servers of the game in the Game box (or the selected account's last "
+                           "game). Click a server to join it right away with the selected accounts. Servers a hop "
+                           "or a join already used are marked \"visited\".")
+        row = ttk.Frame(parent, style="Surface.TFrame")
         row.pack(fill="x", pady=(8, 0))
-        ttk.Label(row, text="Pick:").pack(side="left")
+        ttk.Label(row, text="Pick", style="Card.TLabel").pack(side="left")
         self.mode_var = tk.StringVar(value=sf.MODE_LABELS["best"])
-        self.mode_cb = ttk.Combobox(row, textvariable=self.mode_var, state="readonly", width=38,
+        self.mode_cb = ttk.Combobox(row, textvariable=self.mode_var, state="readonly",
                                     values=[sf.MODE_LABELS[m] for m in sf.MODES])
-        self.mode_cb.pack(side="left", padx=(6, 12))
-        ttk.Label(row, text="At least").pack(side="left")
+        self.mode_cb.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        row2 = ttk.Frame(parent, style="Surface.TFrame")
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Label(row2, text="At least", style="Card.TLabel").pack(side="left")
         self.min_var = tk.IntVar(value=0)
-        ttk.Spinbox(row, from_=0, to=99, textvariable=self.min_var, width=4).pack(side="left", padx=(6, 4))
-        ttk.Label(row, text="players").pack(side="left")
-        self.find_btn = ttk.Button(row, text="Find", command=self.find)
+        ttk.Spinbox(row2, from_=0, to=99, textvariable=self.min_var, width=4).pack(side="left", padx=(6, 4))
+        ttk.Label(row2, text="players", style="Card.TLabel").pack(side="left")
+        self.find_btn = ttk.Button(row2, text="Find", command=self.find)
         self.find_btn.pack(side="right")
+        self.refresh_btn = ttk.Button(row2, text="Refresh", command=lambda: self.find(force=True))
+        self.refresh_btn.pack(side="right", padx=(0, 6))
 
-        cols = ("players", "ping", "job")
-        self.tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
-        for col, text, width, anchor in (("players", "Players", 80, "center"), ("ping", "Ping", 60, "center"),
-                                         ("job", "Server (job) ID", 380, "w")):
-            self.tree.heading(col, text=text)
-            self.tree.column(col, width=width, anchor=anchor)
-        sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        body = ttk.Frame(parent)
-        body.pack(fill="both", expand=True, pady=8)
-        self.tree.pack(in_=body, side="left", fill="both", expand=True)
-        sb.pack(in_=body, side="left", fill="y")
-        self.tree.lift()   # created before `body`, so it would sit under it and be invisible
-        sb.lift()
-        self.tree.bind("<Double-1>", lambda e: self.use_selected())
-
-        bottom = ttk.Frame(parent)
-        bottom.pack(fill="x")
-        self.status_var = tk.StringVar(value="Press Find.")
-        ttk.Label(bottom, textvariable=self.status_var, wraplength=420, justify="left").pack(side="left")
-        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
-        self.use_btn = ttk.Button(bottom, text="Use this server", command=self.use_selected, state="disabled")
-        self.use_btn.pack(side="right", padx=6)
+        self.tree = self._table(parent, (("players", "Players", 64, "center", False), ("ping", "Ping", 56, "center", False),
+                                         ("seen", "History", 60, "center", False), ("job", "Server ID", 110, "w", True)), 8)
+        self.tree.bind("<ButtonRelease-1>", self._row_clicked)   # a real click only: the auto-selected best row does not join
+        self.status_var = tk.StringVar(value="Press Find, then click a server to join it.")
+        self._line(parent, self.status_var)
+        self.use_btn = ttk.Button(parent, text="Only fill Server box", command=self.use_selected, state="disabled")
+        self.use_btn.pack(anchor="w")
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self.use_btn.configure(state="normal" if self.tree.selection() else "disabled"))
 
+    # ---- Private tab ----------------------------------------------------------
     def _build_private(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Pick a game and press Load to see the private servers of the selected account "
-                               "and of its friends. Select one and press Arm, then launch an account. While armed, "
-                               "Launch selected joins that private server and auto-rejoin returns to it (never to a "
-                               "public server). Editing the Game or Server box in the main window un-arms it.",
-                  style="Muted.TLabel", wraplength=640, justify="left").pack(anchor="w")
-
-        row = ttk.Frame(parent)
+        self._note(parent, "Pick a game and press Load to see the private servers of the selected account and of its "
+                           "friends. Select one and press Arm, then launch an account. While armed, Launch selected "
+                           "joins that private server and auto-rejoin returns to it. Editing the Game or Server box "
+                           "un-arms it.")
+        row = ttk.Frame(parent, style="Surface.TFrame")
         row.pack(fill="x", pady=(8, 0))
-        ttk.Label(row, text="Game:").pack(side="left")
-        self.ps_game_var = tk.StringVar(value=self.app.place_var.get())
+        self.ps_game_var = tk.StringVar(value="")   # filled from the Game box when this tab is first shown
         # the same picker as the main window's Game box: saved games, place ID / link, or a name to search
-        self.ps_picker = GamePicker(row, self.app, self.ps_game_var, on_chosen=self.ps_load)
-        self.ps_picker.pack(side="left", padx=(6, 8), fill="x", expand=True)
+        self.ps_picker = GamePicker(row, self.app, self.ps_game_var, style="Surface.TFrame", on_chosen=self.ps_load)
+        self.ps_picker.pack(side="left", fill="x", expand=True)
         self.ps_picker.combobox.bind("<Return>", self._ps_enter)
         self.ps_load_btn = ttk.Button(row, text="Load", command=self.ps_load)
-        self.ps_load_btn.pack(side="right")
+        self.ps_load_btn.pack(side="left", padx=(6, 0))
 
-        row2 = ttk.Frame(parent)
+        row2 = ttk.Frame(parent, style="Surface.TFrame")
         row2.pack(fill="x", pady=(8, 0))
         self.ps_account_var = tk.StringVar(value="Account: none selected")
-        ttk.Label(row2, textvariable=self.ps_account_var, style="Heading.TLabel").pack(side="left")
+        ttk.Label(row2, textvariable=self.ps_account_var, style="CardHeading.TLabel").pack(side="left")
         self.ps_filter_var = tk.StringVar(value=ps.FILTER_LABELS["all"])
-        self.ps_filter_cb = ttk.Combobox(row2, textvariable=self.ps_filter_var, state="readonly", width=16,
+        self.ps_filter_cb = ttk.Combobox(row2, textvariable=self.ps_filter_var, state="readonly", width=14,
                                          values=[ps.FILTER_LABELS[f] for f in ps.FILTERS])
         self.ps_filter_cb.pack(side="right")
         self.ps_filter_cb.bind("<<ComboboxSelected>>", lambda e: self._ps_render())
-        ttk.Label(row2, text="Show:").pack(side="right", padx=(0, 6))
+        ttk.Label(row2, text="Show", style="Card.TLabel").pack(side="right", padx=(0, 6))
 
-        # bottom widgets are packed before the list so the list gets whatever space is left
-        bottom = ttk.Frame(parent)
-        bottom.pack(side="bottom", fill="x")
-        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
-        self.ps_arm_btn = ttk.Button(bottom, text="Arm selected server", command=self.ps_arm, state="disabled")
-        self.ps_arm_btn.pack(side="right", padx=6)
-        self.ps_status_var = tk.StringVar(value="Press Load.")
-        ttk.Label(parent, textvariable=self.ps_status_var, wraplength=640, justify="left").pack(
-            side="bottom", fill="x", pady=(6, 6))   # packed after `bottom`, so it sits just above the buttons
-
-        body = ttk.Frame(parent)      # the list is a child of this frame (see the note in game_picker.py)
-        body.pack(fill="both", expand=True, pady=8)
-        cols = ("name", "from", "owner", "players", "joinable")
-        self.ps_tree = ttk.Treeview(body, columns=cols, show="headings", selectmode="browse")
-        for col, text, width, anchor in (("name", "Server", 220, "w"), ("from", "From", 70, "center"),
-                                         ("owner", "Owner", 150, "w"), ("players", "Players", 70, "center"),
-                                         ("joinable", "Joinable", 70, "center")):
-            self.ps_tree.heading(col, text=text)
-            self.ps_tree.column(col, width=width, anchor=anchor)
-        sb = ttk.Scrollbar(body, orient="vertical", command=self.ps_tree.yview)
-        self.ps_tree.configure(yscrollcommand=sb.set)
-        self.ps_tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
+        self.ps_tree = self._table(parent, (("name", "Server", 90, "w", True), ("from", "From", 52, "center", False),
+                                            ("owner", "Owner", 70, "w", True), ("players", "Players", 62, "center", False),
+                                            ("joinable", "Joinable", 68, "center", False)), 7)
         self.ps_tree.bind("<<TreeviewSelect>>", lambda e: self._ps_picked())
         self.ps_tree.bind("<Double-1>", lambda e: self.ps_arm() if self.ps_arm_btn["state"] == "normal" else None)
+        self.ps_status_var = tk.StringVar(value="Press Load.")
+        self._line(parent, self.ps_status_var)
+        self.ps_arm_btn = ttk.Button(parent, text="Arm selected server", command=self.ps_arm, state="disabled")
+        self.ps_arm_btn.pack(anchor="w")
 
+    # ---- Hopper tab ------------------------------------------------------------
+    def _build_hopper(self, parent: ttk.Frame) -> None:
+        self._hop_hist_sig = None
+        self._note(parent, "Hop now moves the selected accounts into a different public server, picked from the "
+                           "Finder's list and never one in the history below. The old game is fully closed first; "
+                           "if no server has room the account stays put. Auto-hop is off unless you switch it on. "
+                           "Pressing Stop on an account ends its hopping; private-server accounts are skipped.")
+        settings = self.app.settings
+        row = ttk.Frame(parent, style="Surface.TFrame")
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="Pick", style="Card.TLabel").pack(side="left")
+        mode = settings["hopMode"] if settings["hopMode"] in sf.MODES else "best"
+        self.hop_mode_var = tk.StringVar(value=sf.MODE_LABELS[mode])
+        ttk.Combobox(row, textvariable=self.hop_mode_var, state="readonly",
+                     values=[sf.MODE_LABELS[m] for m in sf.MODES]).pack(side="left", padx=(6, 0), fill="x", expand=True)
+        row1 = ttk.Frame(parent, style="Surface.TFrame")
+        row1.pack(fill="x", pady=(6, 0))
+        ttk.Label(row1, text="At least", style="Card.TLabel").pack(side="left")
+        self.hop_min_var = tk.IntVar(value=settings["hopMinPlayers"])
+        ttk.Spinbox(row1, from_=0, to=99, textvariable=self.hop_min_var, width=4).pack(side="left", padx=(6, 4))
+        ttk.Label(row1, text="players", style="Card.TLabel").pack(side="left")
+        self.hop_account_var = tk.StringVar(value="")
+        ttk.Label(row1, textvariable=self.hop_account_var, style="CardMuted.TLabel").pack(side="right")
+
+        row2 = ttk.Frame(parent, style="Surface.TFrame")
+        row2.pack(fill="x", pady=(6, 0))
+        self.hop_auto_var = tk.BooleanVar(value=False)   # off by default; hopping never outlives the app
+        ttk.Checkbutton(row2, text="Auto-hop every", variable=self.hop_auto_var, style="Card.TCheckbutton",
+                        command=self.hop_auto_toggled).pack(side="left")
+        self.hop_every_var = tk.IntVar(value=settings["hopIntervalMinutes"])
+        ttk.Spinbox(row2, from_=sh.MIN_INTERVAL_MINUTES, to=sh.MAX_INTERVAL_MINUTES,
+                    textvariable=self.hop_every_var, width=5).pack(side="left", padx=(6, 4))
+        ttk.Label(row2, text="min", style="Card.TLabel").pack(side="left")
+
+        btns = ttk.Frame(parent, style="Surface.TFrame")
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Hop now", command=self.hop_now).pack(side="left")
+        ttk.Button(btns, text="Stop hopping", command=self.hop_stop).pack(side="left", padx=6)
+        ttk.Button(btns, text="Clear", style="Ghost.TButton", command=self.hop_clear_history).pack(side="left")
+        self.hop_status_var = tk.StringVar(value="Select accounts in the list, then press Hop now.")
+        self._line(parent, self.hop_status_var)
+
+        ttk.Label(parent, text="Hopping accounts", style="CardHeading.TLabel").pack(anchor="w", pady=(6, 0))
+        self.hop_tree = self._table(parent, (("account", "Account", 90, "w", True), ("next", "Next", 52, "center", False),
+                                             ("hops", "Hops", 40, "center", False), ("last", "Last result", 120, "w", True)), 3)
+        hist_lab = ttk.Label(parent, text="History (newest first; a hop never goes back into these)",
+                             style="CardHeading.TLabel", wraplength=self.wrap, justify="left")
+        hist_lab.pack(anchor="w", pady=(10, 0))
+        ui_style.autowrap(hist_lab, parent)
+        self.hop_hist = self._table(parent, (("time", "Time", 64, "center", False), ("account", "Account", 80, "w", True),
+                                             ("game", "Game", 70, "center", False), ("server", "Server ID", 100, "w", True)), 5)
+
+    # ---- actions ---------------------------------------------------------------
     def _mode(self) -> str:
         label = self.mode_var.get()
         return next((m for m, text in sf.MODE_LABELS.items() if text == label), "best")
@@ -487,7 +215,8 @@ class JoinDialog(tk.Toplevel):
             pass
 
     # ---- actions --------------------------------------------------------
-    def find(self) -> None:
+    def find(self, force: bool = False) -> None:
+        """Uses the session cache (see server_finder.ServerCache); `force` asks Roblox again."""
         if self._busy:
             return
         place_id = self.app.resolve_place(self.app.selected_accounts())
@@ -496,18 +225,19 @@ class JoinDialog(tk.Toplevel):
         try:
             min_players = max(0, int(self.min_var.get()))
         except (ValueError, tk.TclError):
-            messagebox.showwarning("Find a server", "'At least ... players' must be a number.", parent=self)
+            messagebox.showwarning("Find a server", "'At least ... players' must be a number.", parent=self.nb)
             return
         mode = self._mode()
         self._busy = True
         self.find_btn.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
         self.tree.delete(*self.tree.get_children())
         self.use_btn.configure(state="disabled")
         self._set_status(f"Looking up servers for place {place_id}...")
 
         def work() -> None:
             try:
-                found = sf.find_servers(place_id)
+                found = sf.find_servers_cached(place_id, force=force)
                 ranked = sf.rank(found.servers, mode, min_players=min_players)
                 sf.record_result(place_id, mode, len(found.servers), ranked[0].job_id if ranked else None)
                 self.app.ui(lambda: self._show(place_id, found, ranked, min_players))
@@ -521,6 +251,7 @@ class JoinDialog(tk.Toplevel):
         self._busy = False
         try:
             self.find_btn.configure(state="normal")
+            self.refresh_btn.configure(state="normal")
         except tk.TclError:
             pass
 
@@ -536,13 +267,18 @@ class JoinDialog(tk.Toplevel):
             for s in ranked:
                 self.tree.insert("", "end", iid=s.job_id,
                                  values=(f"{s.playing}/{s.max_players}", "" if s.ping is None else f"{s.ping} ms",
-                                         s.job_id))
+                                         "visited" if self.app.hopper.was_visited(place_id, s.job_id) else "",
+                                         short_id(s.job_id)))
             note = " The list may be incomplete (Roblox stopped answering)." if found.partial else ""
+            if found.stale:
+                note += f" Roblox is not answering or is rate-limiting, so this is an older list ({int(found.age)}s old)."
+            elif found.cached:
+                note += f" From cache ({int(found.age)}s old); press Refresh for a new list."
             if ranked:
                 self.tree.selection_set(ranked[0].job_id)
                 self.tree.focus(ranked[0].job_id)
-                self._set_status(f"{len(ranked)} of {len(found.servers)} servers match; the best is selected. "
-                                 f"Servers fill up fast, so join soon.{note}")
+                self._set_status(f"{len(ranked)} of {len(found.servers)} servers match. Click one to join it "
+                                 f"now; servers fill up fast.{note}")
             elif found.servers:
                 self._set_status(f"{len(found.servers)} servers found, but none match "
                                  f"(at least {min_players} players, with room).{note}")
@@ -550,6 +286,41 @@ class JoinDialog(tk.Toplevel):
                 self._set_status("This game has no public servers right now." + note)
         except tk.TclError:
             pass
+
+    def _row_clicked(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return   # the column headings are not servers
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.join_server(iid)
+
+    def join_server(self, job_id: str) -> None:
+        """Joins this exact server right now with the accounts selected in the main window. `strict`:
+        an account that does not get into THIS server is closed, never sent somewhere else."""
+        server, place_id = self._servers.get(job_id), self._place_id
+        if server is None or place_id is None or self._joining:
+            return
+        accounts = self.app.selected_accounts()
+        if not accounts:
+            messagebox.showinfo("Join server", "Select one or more accounts in the main window first. "
+                                               "They are the accounts that join.", parent=self.nb)
+            return
+        if not server.has_room:
+            self._set_status("That server is full. Pick another one.")
+            return
+        self._joining = True
+        try:
+            # move: an account that is already playing is closed completely, then rejoins in THIS server
+            self.app.launch_accounts(accounts, place_id, job_id, strict=True, move=True)
+            started = [a for a in accounts if a.id in self.app.launching]
+        finally:
+            self._joining = False
+        if not started:
+            self._set_status("Nothing was launched (the account is already in that server, or the "
+                             "launch was cancelled).")
+            return
+        self.app.hopper.record_visit(place_id, job_id, ", ".join(a.username for a in started[:3]))
+        self.app.set_status(f"Joining server {job_id[:8]}... with {len(started)} account(s)...")
 
     def use_selected(self) -> None:
         sel = self.tree.selection()
@@ -560,7 +331,6 @@ class JoinDialog(tk.Toplevel):
             self.app.place_var.set(str(self._place_id))  # keep the server and the game together
         self.app.job_var.set(job_id)
         self.app.set_status("Server chosen. Launch an account to join it.")
-        self.destroy()
 
     # ---- tabs -----------------------------------------------------------
     def _tab_changed(self) -> None:
@@ -568,16 +338,191 @@ class JoinDialog(tk.Toplevel):
             current = self.nb.tab(self.nb.select(), "text")
         except tk.TclError:
             return
-        if current == "Join friend":
-            self.friend_tab.activate()
-        else:
-            self.friend_tab.deactivate()
-        if current == "Private server":
+        if current == "Private":
+            if not self.ps_game_var.get().strip():
+                self.ps_game_var.set(self.app.place_var.get())
             self._ps_refresh_account()
+        if current == "Hopper":
+            self._hop_refresh_account()
+
 
     def destroy(self) -> None:
-        self.friend_tab.deactivate()   # releases the account lock on the main list
-        super().destroy()
+        """Stops the 1-second refresh. Hopping itself keeps running: it belongs to the app."""
+        if self._hop_job is not None:
+            try:
+                self.nb.after_cancel(self._hop_job)
+            except tk.TclError:
+                pass
+            self._hop_job = None
+
+    # ---- server hopper ----------------------------------------------------
+    def _hop_mode(self) -> str:
+        label = self.hop_mode_var.get()
+        return next((m for m, text in sf.MODE_LABELS.items() if text == label), "best")
+
+    def _hop_refresh_account(self) -> None:
+        try:
+            accounts = self.app.selected_accounts()
+            self.hop_account_var.set(f"{len(accounts)} selected")
+        except tk.TclError:
+            pass
+
+    def _hop_params(self, need_interval: bool = True) -> tuple[float, int] | None:
+        """(minutes, min_players). Hop now has no schedule, so it does not care about the interval box."""
+        try:
+            min_players = max(0, int(self.hop_min_var.get()))
+            minutes = float(self.hop_every_var.get())
+        except (ValueError, tk.TclError):
+            if need_interval:
+                messagebox.showwarning("Server hopper", "'Auto-hop every' and 'At least' must be numbers.",
+                                       parent=self.nb)
+                return None
+            try:
+                min_players, minutes = max(0, int(self.hop_min_var.get())), float(sh.MIN_INTERVAL_MINUTES)
+            except (ValueError, tk.TclError):
+                messagebox.showwarning("Server hopper", "'At least' must be a number.", parent=self.nb)
+                return None
+        if need_interval and minutes < sh.MIN_INTERVAL_MINUTES:
+            messagebox.showwarning("Server hopper", f"Auto-hop at most every {sh.MIN_INTERVAL_MINUTES} minutes; "
+                                   "faster only causes failed launches and rate limits.", parent=self.nb)
+            return None
+        return max(minutes, float(sh.MIN_INTERVAL_MINUTES)), min_players
+
+    def _hop_place_for(self, accounts: list) -> tuple[bool, int | None]:
+        """(ok, place). A place is needed only for accounts that are not running yet; running ones
+        hop within the game they are in."""
+        snap = self.app.client_snapshot()
+        idle = [a for a in accounts if a.id not in snap]
+        if not idle:
+            return True, None
+        place_id = self.app.resolve_place(idle)
+        return place_id is not None, place_id
+
+    def hop_auto_toggled(self) -> None:
+        """The Auto-hop checkbox. On: schedule the selected accounts. Off: cancel every schedule."""
+        if self.hop_auto_var.get():
+            if not self.hop_start():
+                self.hop_auto_var.set(False)   # cancelled or invalid: stay off
+        else:
+            self.app.hopper.disable_all()
+            self.hop_status_var.set("Auto-hop is off. Their games keep running.")
+            self._hop_render()
+
+    def hop_start(self) -> bool:
+        """Turns on the timer for the selected accounts. Returns False if nothing was started."""
+        accounts = self.app.selected_accounts()
+        if not accounts:
+            messagebox.showinfo("Server hopper", "Select one or more accounts in the main window first.", parent=self.nb)
+            return False
+        params = self._hop_params()
+        if params is None:
+            return False
+        minutes, min_players = params
+        ok, place_id = self._hop_place_for(accounts)
+        if not ok:
+            return False
+        if not self.app.confirm(
+                "Start auto-hop?",
+                f"Every {minutes:g} minutes each of these {len(accounts)} account(s) will be closed and started "
+                "again in a different server:\n\n" + ", ".join(a.username for a in accounts[:8])
+                + (" ..." if len(accounts) > 8 else ""), parent=self.nb):
+            return False
+        mode = self._hop_mode()
+        settings = self.app.settings
+        settings["hopIntervalMinutes"], settings["hopMode"], settings["hopMinPlayers"] = int(minutes), mode, min_players
+        try:
+            settings.save()
+        except OSError:
+            pass
+        snap = self.app.client_snapshot()
+        for n, a in enumerate(accounts):   # staggered, so they do not all hop in the same minute
+            running = a.id in snap
+            self.app.hopper.enable(a, interval_minutes=minutes, mode=mode, min_players=min_players,
+                                   place_id=place_id, first_in=(minutes * 60 + n * 30) if running else n * 20)
+        self.hop_status_var.set(f"Auto-hop on: {len(accounts)} account(s) every {minutes:g} min.")
+        self._hop_render()
+        return True
+
+    def hop_now(self) -> None:
+        accounts = self.app.selected_accounts()
+        if not accounts:
+            messagebox.showinfo("Server hopper", "Select one or more accounts in the main window first.", parent=self.nb)
+            return
+        params = self._hop_params(need_interval=False)
+        if params is None:
+            return
+        minutes, min_players = params
+        todo = [a for a in accounts if not self.app.hopper.is_enabled(a)]
+        place_id = None
+        if todo:
+            ok, place_id = self._hop_place_for(todo)
+            if not ok:
+                return
+        if not self.app.confirm("Hop now?", f"Close and restart {len(accounts)} account(s) in a different server now?",
+                                parent=self.nb):
+            return
+        for n, a in enumerate(todo):   # no plan yet: a single hop that removes itself
+            self.app.hopper.enable(a, interval_minutes=minutes, mode=self._hop_mode(), min_players=min_players,
+                                   place_id=place_id, first_in=n * 20, repeat=False)
+        for a in accounts:
+            self.app.hopper.hop_now(a)
+        self.hop_status_var.set(f"Hopping {len(accounts)} account(s) now.")
+        self._hop_render()
+
+    def hop_stop(self) -> None:
+        accounts = self.app.selected_accounts()
+        n = sum(1 for a in accounts if self.app.hopper.disable(a, "stopped by you"))
+        self.hop_status_var.set(f"Stopped hopping for {n} account(s). Their games keep running.")
+        self._hop_render()
+
+    def hop_clear_history(self) -> None:
+        self.app.hopper.clear_history()
+        self.hop_status_var.set("History cleared: hops may go back into any server again.")
+        self._hop_render()
+
+    def _hop_render(self) -> None:
+        try:
+            rows = self.app.hopper.snapshot()
+            seen = set()
+            for r in rows:
+                seen.add(r["id"])
+                if r["repeat"]:
+                    mins, secs = divmod(int(r["next_in"]), 60)
+                    nxt = f"{mins}:{secs:02d}" if r["next_in"] else "now"
+                else:
+                    nxt = "now"   # a one-off hop has no timer
+                values = (r["username"], nxt, r["hops"], r["last"])
+                if self.hop_tree.exists(r["id"]):
+                    self.hop_tree.item(r["id"], values=values)
+                else:
+                    self.hop_tree.insert("", "end", iid=r["id"], values=values)
+            for iid in self.hop_tree.get_children():
+                if iid not in seen:
+                    self.hop_tree.delete(iid)
+            if self.hop_auto_var.get() and not any(r["repeat"] for r in rows):
+                self.hop_auto_var.set(False)   # every timer ended (Stop in the main window, failures)
+            self._hop_render_history()
+        except tk.TclError:
+            pass
+
+    def _hop_render_history(self) -> None:
+        rows = self.app.hopper.history()
+        sig = (len(rows), rows[0]["seq"] if rows else 0)
+        if sig == self._hop_hist_sig:
+            return   # nothing new: leave the list (and the user's scroll position) alone
+        self._hop_hist_sig = sig
+        self.hop_hist.delete(*self.hop_hist.get_children())
+        for r in rows:
+            self.hop_hist.insert("", "end", values=(time.strftime("%H:%M:%S", time.localtime(r["at"])),
+                                                    r["who"], r["place_id"], short_id(r["job_id"])))
+
+    def _hop_tick(self) -> None:
+        self._hop_refresh_account()
+        self._hop_render()
+        try:
+            self._hop_job = self.nb.after(1000, self._hop_tick)
+        except tk.TclError:
+            self._hop_job = None
 
     # ---- private server list ---------------------------------------------
     def _ps_refresh_account(self) -> None:
@@ -600,7 +545,7 @@ class JoinDialog(tk.Toplevel):
         raw = self.ps_game_var.get().strip()
         if not raw:
             messagebox.showinfo("Private servers", "Pick a saved game, paste a place ID / roblox.com link, or "
-                                                   "type a name and press Search.", parent=self)
+                                                   "type a name and press Search.", parent=self.nb)
             return None
         saved = self.app.places.find(raw)
         if saved:
@@ -616,7 +561,7 @@ class JoinDialog(tk.Toplevel):
         accounts = self.app.selected_accounts()
         if not accounts:
             messagebox.showinfo("Private servers", "Select an account in the main window first. Its own private "
-                                                   "servers and its friends' are listed.", parent=self)
+                                                   "servers and its friends' are listed.", parent=self.nb)
             return
         place_id = self._ps_place()
         if place_id is None:
@@ -716,4 +661,3 @@ class JoinDialog(tk.Toplevel):
         self.app.arm_private(extra, place_id)
         private_links.record_result("armed", place_id)
         self.app.set_status("Private server armed. Launch an account to join it.")
-        self.destroy()

@@ -36,17 +36,26 @@ Written in pure Python with no third-party dependencies required (the system tra
 - After an unclean exit such as a crash or power loss, dead clients for accounts with auto-rejoin on are relaunched. After a normal quit they are left alone.
 
 **Groups and notes**
-- Give each account a group and a short note. Filter the table by group, launch a whole group with one click, and set a default game per group (it is used when the Game box is empty).
-- Console selection accepts `group:<name>`; `setgroup` and `setnote` edit them.
+- The main window no longer shows or edits groups and notes. Values saved earlier are kept in your accounts file, and the console (`setgroup`, `setnote`, `group:<name>`) and the scheduler still understand them.
 
 **Notifications**
 - Alerts for disconnects, auto-rejoin giving up, and expired cookies, sent to a Discord webhook and/or the system tray. Each event is rate-limited per account (default 120 s).
 - The webhook URL is stored encrypted with DPAPI in `secrets.json`, never in `settings.json`, and is redacted from logs and diagnostics. Messages never ping anyone.
 
-**Join tools** (Game box, **Find server...**)
-- Server finder: pick the emptiest, fullest, "best" (fullest that is not full) or a minimum-player server and drop its job ID into the Game box.
-- Friend join: look up a friend by username or ID and join their server (shows "unavailable" when their privacy settings hide it).
-- Private servers (experimental): pick a game and choose one of your own or your friends' private servers. The code is kept in memory only, so after a crash the client is re-attached but not relaunched.
+**Join tools** (the left panel of the main window: one notebook with the tabs **Player | Finder | Private | Hopper | History | Current**, all on one screen; there is no separate Find server window)
+- **Window:** the main window can be resized and maximized by dragging its edges (it never goes below a minimum size). Clicking buttons, searching or switching tabs never changes its size. Table column borders cannot be dragged. A tab scrolls by itself only when the screen is too short to show all of it.
+- **Player tab:** look up any player by username, ID or profile link, or pick one from History or Online friends. Picking only selects them; the Launch selected button then reads "Join <name>" and joins their exact server (job ID) with every selected account Roblox lets in. **Stay and wait if the server is full** (on by default): the Roblox client is left open and this app never closes it while it waits to get into that server. There is no timeout; the "disconnected" checks are switched off for it until it is in the server; its status reads "Waiting to get in...". Press Stop to end the wait. Only if the client process itself exits is the same server launched again after 20 s, never another server. Untick the box and an account that cannot get in is closed after about 75 s. An account that is already playing is closed completely first, then rejoins in that server. "Unavailable" is shown when their privacy settings hide the server.
+  - **Player history** keeps the last 30 players you actually **joined** (`join_history.json`, no cookies). Only pressing join saves someone: looking a player up, or picking them, does not.
+  - **Launching normally:** once a join has started, the picked player is dropped by itself, so the next Launch selected is a normal launch from the Game box. To drop the pick earlier press **Clear player (launch normally)**, press Esc, or click the picked row again. While a player or server is picked, a **Launch normally** button under the Join button (and in the right-click menu) launches the highlighted accounts into the Game box and drops the pick.
+- **Finder tab:** pick the emptiest, fullest, "best" (fullest that is not full) or a minimum-player server and click it to join it. Lists are cached for 2 minutes per game (*Refresh* forces a new one) and requests pause for 90 s after a rate limit, so Roblox's 429 is rarely hit. Clicking a server also closes and moves running accounts. *Only fill Server box* puts the ID into the Game panel's Server box without launching.
+- **Hopper tab:** move the selected accounts to a new server every N minutes, or once with *Hop now*. The old game is fully closed before the new one starts, so an account never has two clients.
+- **Private tab (experimental):** pick a game and choose one of your own or your friends' private servers, then Arm it. The code is kept in memory only, so after a crash the client is re-attached but not relaunched.
+- **Current tab:** only the servers where your accounts are in right now (Game, Server ID, Accounts), updated by itself. Click one to pick it, then use the Join button, exactly like History. Servers listed here can not be cleared: History's *Clear all* and *Remove from history*, and an account's *Clear this account's history*, skip any server an account is in right now. They become normal rows once the account leaves.
+- **History tab:** every server any of your accounts got into, all games together, newest first: Game, Server ID, When, Accounts. A server is listed only after Roblox confirms the account is in it, so random joins and teleports are included and failed joins are not. Up to 200 servers are kept in `server_history.json` (no cookies). Click a server to pick it (nothing launches), select accounts, then press the Join button (Launch selected). Each selected account goes to that exact server; one already playing is closed completely first. If the server is full the client stays open and waits until it gets in or you press Stop. Click the picked row again to un-pick it; the pick is also dropped once the join has started. Right-click copies the full server ID or removes the row. **Where is my account now?** Servers that have an account in them right now are listed first, in green, with *Online now* and the online account names; the accounts table shows the same short server ID in its *Server · Last game* column. This comes from the presence check that already runs for every client, It refreshes by itself: a new join shows within about 5-20 seconds (a confirmed account is re-checked every 15 s, one that is still loading every 5 s), using a light background check that never triggers a rejoin.
+
+**Per-account server history and following another account**
+- Every account keeps its own list of servers with the date and time (`account_history.json`, last 50 per account, no cookies). Right-click an account > *Server history...* to see it; pick a row and press *Join with selected accounts*.
+- Right-click > *Join same server as* > an account: the selected accounts join the exact server that account is in right now. Your own account's server is read with its own login, so this works even when that account's privacy hides it from other people, and no friend request or friend-join is needed. Works for public servers only, and a full server is waited for like any other history join.
 
 **Resource saver**
 - Normal, Low and Minimum profiles write client flags (currently an FPS cap) before each launch. The original `ClientAppSettings.json` is backed up once and **Restore original** puts back the exact bytes (or deletes the file if there was none).
@@ -149,6 +158,8 @@ Treat a cookie like a password. Anyone who has it can use that account. Never sh
 | Auto-tile | Off | Re-tile when a client starts or rejoins |
 | Scheduler enabled | On | Run schedule rules (checked every 30 s) |
 | Missed-run window | 30 min | How late a missed scheduled run may still fire |
+| Macros on | On | Master switch for macro hotkeys (the Macros window has the checkbox; Ctrl+Shift+F12 always stops every macro) |
+| Macro max run | 60 min | A macro still running after this long stops by itself (`macroMaxRunMinutes` in settings.json) |
 
 ---
 
@@ -164,6 +175,7 @@ Everything is stored locally in `%APPDATA%\RobloxAccountManager\`:
 | `sessions.json` | Which account is in which game and client, for recovery (private-server codes are never saved) |
 | `secrets.json` | DPAPI-encrypted secrets, currently the Discord webhook URL |
 | `schedules.json` | Scheduler rules and when each last ran |
+| `macros.json` | Hotkey macros (hotkey, click type, position, repeat, interval, run count, recordings) |
 | `resource_backup.json` | Original client-settings backup for Restore original |
 | `multi_instance.log`, `rejoin_debug.log` | Size-capped logs (the second only when a disconnect marker fires) |
 | `diagnostics_report.txt` | Last saved diagnostics report |
@@ -197,7 +209,12 @@ gui.py              Tkinter desktop app
 theme.py            Design tokens: spacing, type scale, contrast-checked colours (pure)
 ui_style.py         Applies the tokens to ttk (styles, tooltips, menus)
 icons.py            Icon set drawn from geometry, encoded as PNG (no image files)
-join_dialog.py      Find server / Join friend / Private server dialog
+join_dialog.py      Finder / Private / Hopper tabs of the left panel
+join_panel.py       Player tab: look up a player, history of joined players, online friends, join their server
+join_history.py     Saved list of players you looked up or joined (join_history.json)
+server_history.py   Servers accounts got into, all games (server_history.json)
+server_history_panel.py  The History tab of the left panel
+current_servers_panel.py  The Current tab of the left panel (servers your accounts are in now)
 schedule_window.py  Schedule list and rule editor
 settings.py         Settings and defaults (no Tk, testable anywhere)
 version.py          App version
@@ -219,6 +236,11 @@ resourcesaver.py    Client-flag profiles with backup and restore
 winapi.py           Win32 window and monitor access (lazy, Windows only)
 winlayout.py        Grid maths and tiling (pure)
 scheduler.py        Rule store and due-run logic
+macros.py           Macro record, macros.json, hotkey parsing and validation (pure)
+macro_engine.py     Runs macros: one worker per macro, hotkey toggle, safeguards, recording control (no Win32)
+hotkeys.py          Global hotkeys (RegisterHotKey thread) and a fake for tests
+recorder.py         Records mouse and keyboard input for recorded macros (low-level hooks) and a fake for tests
+macros_window.py    Macros dashboard and add/edit form
 net.py              HTTP with retries and the CSRF handshake (new code)
 workers.py          Background worker thread
 jsonio.py           Atomic JSON read/write

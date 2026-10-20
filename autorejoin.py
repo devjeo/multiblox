@@ -52,6 +52,16 @@ DISCONNECT_MARKERS = (
 GRACE_SECONDS = 30            # ignore disconnect signals right after a client starts
 MARKER_DEBOUNCE_SECONDS = 15  # wait this long after a log marker, then check presence
 PRESENCE_POLL_SECONDS = 45
+# Location checks: they only learn WHERE an account is (server history, the green "Online now" rows) and
+# never count as a miss, so they cannot cause a rejoin. The slow PRESENCE_POLL_SECONDS poll above is still
+# the only one that detects a disconnect. A client that has not been confirmed in a server yet is asked
+# often, so a new join shows up within seconds; later the check slows down. Asked in the background, so a
+# slow Roblox answer never delays the other accounts.
+LOCATION_START_SECONDS = 15   # not before the client has had time to load (presence still shows the old server)
+LOCATION_FAST_SECONDS = 5     # until confirmed (or LOCATION_FAST_WINDOW seconds after the launch)
+LOCATION_FAST_WINDOW = 300
+LOCATION_LIVE_SECONDS = 15    # once confirmed: notices a teleport or a leave quickly
+LOCATION_BACKOFF_SECONDS = 30  # after an answer of "could not tell" (rate limit, network): wait longer
 PRESENCE_MISS_LIMIT = 2       # consecutive "not in game" polls before rejoining
 REJOIN_COOLDOWN_SECONDS = 8
 SETTLE_SECONDS = 6            # pause after a launch so the event-handle closer can finish
@@ -65,6 +75,12 @@ LOG_MAP_TIMEOUT = 180
 STRICT_FIRST_CHECK_SECONDS = 20
 STRICT_POLL_SECONDS = 10
 STRICT_JOIN_SECONDS = 75
+# "Patient" joins (a player's or a history server, e.g. a full server): the client is LEFT OPEN for as
+# long as it takes. There is no timeout, nothing is closed or relaunched while it waits, and the
+# presence and log checks that would call it "disconnected" are skipped until it is in the server
+# (or Stop is pressed). Only if the client process itself exits (Roblox quit, or the window was
+# closed) is the SAME server launched again after this many seconds.
+PATIENT_RETRY_SECONDS = 20
 
 DEBUG_LOG = DATA_DIR / "rejoin_debug.log"   # under %APPDATA%: a PyInstaller exe has no stable folder next to the script
 PRESENCE_NAMES = {0: "offline", 1: "online (not in a game)", 2: "in game", 3: "in Studio"}
@@ -183,7 +199,7 @@ class Client:
     place_id: int
     job_id: str | None
     pid: int | None = None
-    state: str = "starting"  # starting | running | rejoining | waiting_retry | gave_up | closed
+    state: str = "starting"  # starting | running | rejoining | waiting_retry | waiting_slot | gave_up | closed
     started: float = 0.0
     log_path: Path | None = None
     log_offset: int = 0
@@ -201,19 +217,26 @@ class Client:
     strict_job: str | None = None   # server this launch MUST reach; None = ordinary launch
     strict_ok: bool = False         # presence has confirmed the account is in strict_job
     strict_checked: float = 0.0
+    patient: bool = False           # with strict_job: keep retrying that server instead of giving up
+    waits: int = 0                  # how many times a patient join had to start over
     created_utc: datetime | None = None  # process start time, used to re-attach after an app restart
     # Private-server launch data (see private_links). In memory only, hidden from repr. `private`
     # stays True for an adopted client whose code was (deliberately) not saved; such a client is
     # never relaunched into a public server.
     extra: dict | None = field(default=None, repr=False)
     private: bool = False
+    reported: tuple | None = None   # (place, job) last passed to on_server_fn, so each is reported once
+    in_game: bool | None = None     # latest presence answer: in a game? None = not asked yet / could not tell
+    last_location_poll: float = 0.0
+    fetching: bool = False          # a presence request is running in the background
+    fetched: tuple | None = field(default=None, repr=False)   # its answer, applied on the manager thread
 
 
 class RejoinManager(threading.Thread):
     def __init__(self, store, launch_fn, list_pids_fn, kill_fn, log_fn=print,
                  log_dir: Path | None = None, creation_fn=process_creation_utc, presence_fn=None,
                  clock=time.monotonic, sleep=time.sleep, spawn=None,
-                 notify_fn=None, on_ready_fn=None, family_fn=None):
+                 notify_fn=None, on_ready_fn=None, family_fn=None, on_server_fn=None):
         super().__init__(daemon=True)
         self.store = store
         self.launch_fn = launch_fn      # (account, place_id, job_id) -> None, raises on failure
@@ -227,6 +250,8 @@ class RejoinManager(threading.Thread):
         self.clock, self.sleep = clock, sleep
         self.notify_fn = notify_fn      # (event, account_username, detail) -> None; see _emit
         self.on_ready_fn = on_ready_fn  # (client) -> None, once a client's process is being tracked
+        self.on_server_fn = on_server_fn  # (account, place_id, job_id, game_name) -> None, once per server
+                                          # a client is CONFIRMED in (server history)
         self.family_fn = family_fn      # () -> {pid: parent_pid} of running game clients (optional);
                                         # lets us follow a client that hands over to a new process
         self._spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start())
@@ -237,7 +262,7 @@ class RejoinManager(threading.Thread):
 
     # ---- public API ----------------------------------------------------
     def launch(self, account, place_id: int, job_id: str | None = None, extra: dict | None = None,
-               strict: bool = False) -> Client:
+               strict: bool = False, patient: bool = False) -> Client:
         """Launch an account, wait until its client appears, and start tracking it.
         `extra` is private-server launch data (see private_links); it is kept in memory for
         rejoins and never saved. Raises whatever launch_fn raises (LaunchError)."""
@@ -246,6 +271,7 @@ class RejoinManager(threading.Thread):
             client = Client(account, place_id, None if private else job_id, extra=extra or None, private=private)
             if strict and job_id and not private:
                 client.strict_job = job_id
+                client.patient = patient
             before = set(self.list_pids())
             if private:
                 self.launch_fn(account, place_id, None, extra=extra)
@@ -259,6 +285,40 @@ class RejoinManager(threading.Thread):
             self._await_pid(client, before)
             self.sleep(SETTLE_SECONDS)
         return client
+
+    def hop(self, account, place_id: int, job_id: str | None, *, close_timeout: float = 20.0,
+            strict: bool = False, patient: bool = False) -> Client:
+        """Move an account to another server: close its current client COMPLETELY, then launch a new
+        one into `job_id`. The two never run at the same time. Raises RuntimeError (and leaves the
+        old client tracked and untouched in the manager) if the old client will not close, so an
+        account is never left with two clients. If only the new launch fails, the account is handed
+        to auto-rejoin (any server) when it has that switched on, otherwise it is left closed."""
+        with self._lock:
+            old = self.clients.get(account.id)
+        if old is not None:
+            old.cancelled = True            # the watcher and any rejoin in progress now ignore it
+            pids = self._lineage_pids(old)
+            self._kill_lineage(old)
+            deadline = self.clock() + close_timeout
+            while pids & set(self.list_pids()):
+                if self.clock() >= deadline:
+                    old.cancelled = False   # still running: keep watching it as before
+                    raise RuntimeError(f"the old client (PID {', '.join(map(str, sorted(pids)))}) did not close; "
+                                       "if Roblox runs as administrator, run this app as administrator too")
+                self.sleep(0.5)
+            self.log(f"[hop] {account.username}: old client closed")
+        try:
+            return self.launch(account, place_id, job_id, strict=strict, patient=patient)
+        except Exception:
+            if old is not None:
+                with self._lock:
+                    if self.clients.get(account.id) is old:
+                        old.pid, old.job_id, old.cancelled = None, None, False
+                        if account.autoRejoinEnabled:
+                            old.state, old.retry_at = "waiting_retry", self.clock() + RETRY_DELAY_SECONDS
+                        else:
+                            old.state = "closed"
+            raise
 
     def set_enabled(self, account, enabled: bool) -> None:
         account.autoRejoinEnabled = enabled
@@ -308,6 +368,7 @@ class RejoinManager(threading.Thread):
         c.log_path, c.log_offset = None, 0     # the new process writes a new log file
         c.marker_at, c.misses = None, 0
         c.started = c.last_presence = self.clock()   # fresh grace period while it loads
+        c.in_game, c.last_location_poll, c.fetched = None, 0.0, None   # not confirmed in a server yet
         try:
             c.created_utc = self.creation_fn(c.pid)
         except Exception:
@@ -350,6 +411,24 @@ class RejoinManager(threading.Thread):
             self.log(f"[rejoin] {account.username}: stopped on request (PID {client.pid})")
             return True
         return False
+
+    def live_servers(self) -> dict:
+        """Where accounts are right now: {(place_id, job_id): {"game": str, "names": [username, ...]}}.
+        Only clients that are running AND whose server Roblox's presence has confirmed (the same fact
+        that feeds the server history) are listed, so a launch that is still loading, waiting for a
+        full server, rejoining or closed is not shown as being in a server. Reads memory only: no
+        request is made."""
+        out: dict = {}
+        with self._lock:
+            for c in self.clients.values():
+                if c.state != "running" or c.cancelled or c.private or not c.job_id:
+                    continue
+                if c.reported != (c.place_id, c.job_id) or c.in_game is not True:
+                    continue
+                entry = out.setdefault((c.place_id, c.job_id), {"game": "", "names": []})
+                entry["names"].append(c.account.username)
+                entry["game"] = entry["game"] or getattr(c.account, "lastGameName", "") or ""
+        return out
 
     def resume(self, account) -> bool:
         """Clear a 'gave up' state and try again now."""
@@ -453,6 +532,9 @@ class RejoinManager(threading.Thread):
                 elif c.state == "waiting_retry" and now >= c.retry_at:
                     c.state = "rejoining"
                     self._spawn(self._rejoin, c)
+                elif c.state == "waiting_slot" and now >= c.retry_at:
+                    c.retry_at = float("inf")       # the retry below sets the next time itself
+                    self._spawn(self._retry_exact, c)
             except Exception as exc:
                 self.log(f"[rejoin] {c.account.username}: internal error: {exc!r}")
 
@@ -466,6 +548,8 @@ class RejoinManager(threading.Thread):
         uptime = now - c.started
         if self._check_strict(c, now, uptime):
             return
+        if c.patient and c.strict_job and not c.strict_ok:
+            return    # waiting to get in: leave the client alone (no log or presence "disconnect" checks)
         self._poll_log(c, now, uptime)
 
         if c.marker_at is not None and now - c.marker_at >= MARKER_DEBOUNCE_SECONDS:
@@ -480,9 +564,45 @@ class RejoinManager(threading.Thread):
             else:
                 self.log(f"[rejoin] {c.account.username}: log marker '{marker}' but still in game; ignoring")
 
-        if now - c.last_presence >= PRESENCE_POLL_SECONDS:
-            c.last_presence = now
-            self._poll_presence(c, uptime)
+        self._apply_fetched(c)
+        regular = now - c.last_presence >= PRESENCE_POLL_SECONDS
+        if not regular and uptime < LOCATION_START_SECONDS:
+            return
+        if regular or now - c.last_location_poll >= self._location_interval(c, uptime):
+            if c.fetching:
+                return
+            if regular:
+                c.last_presence = now
+            c.last_location_poll = now
+            c.fetching = True
+            self._spawn(self._fetch_presence, c, uptime, regular)
+            self._apply_fetched(c)       # (a synchronous spawn, as in the tests, has answered already)
+
+    def _location_interval(self, c: Client, uptime: float) -> float:
+        confirmed = c.reported == (c.place_id, c.job_id)
+        fast = not confirmed and uptime < LOCATION_FAST_WINDOW
+        return min(LOCATION_FAST_SECONDS if fast else LOCATION_LIVE_SECONDS, PRESENCE_POLL_SECONDS)
+
+    def _fetch_presence(self, c: Client, uptime: float, regular: bool) -> None:
+        """Runs in a background thread: only asks Roblox. Everything that changes state is done by
+        _apply_fetched on the manager thread."""
+        try:
+            p = self.presence_fn(c.account)
+        except Exception as exc:
+            self.log(f"[rejoin] {c.account.username}: presence check failed: {exc!r}")
+            p = None
+        c.fetched = (p, uptime, regular)
+        c.fetching = False
+
+    def _apply_fetched(self, c: Client) -> None:
+        got, c.fetched = c.fetched, None
+        if got is None or c.state != "running" or c.cancelled:
+            return
+        p, uptime, regular = got
+        if p is None:
+            c.last_location_poll = self.clock() + LOCATION_BACKOFF_SECONDS - LOCATION_LIVE_SECONDS
+            return
+        self._poll_presence(c, uptime, p, regular)
 
     def _check_strict(self, c: Client, now: float, uptime: float) -> bool:
         """For a launch that must land in one specific server (friend join). Confirms it through
@@ -495,12 +615,50 @@ class RejoinManager(threading.Thread):
             p = self.presence_fn(c.account)
             if p and p.get("userPresenceType") == 2 and p.get("gameId") == c.strict_job:
                 c.strict_ok = True
+                self._report_server(c, p)
                 return False
-        if uptime < STRICT_JOIN_SECONDS:
+        if uptime < STRICT_JOIN_SECONDS or c.patient:   # a patient join never times out
             return False
         self._abandon_strict(c, f"did not get into the requested server within {STRICT_JOIN_SECONDS}s "
                                 "(Roblox refused the join, it is friends-only, or the server is full)")
         return True
+
+    def _wait_for_slot(self, c: Client, reason: str) -> None:
+        """Patient join whose client process is GONE before it got in: launch the SAME server again soon.
+        Only called when the process has exited, never to close a waiting client. Runs until it gets in;
+        Stop (stop_account) ends it. Not limited by MAX_ATTEMPTS."""
+        c.waits += 1
+        c.state = "waiting_slot"
+        c.retry_at = self.clock() + PATIENT_RETRY_SECONDS
+        self._kill_lineage(c)
+        self.log(f"[join] {c.account.username}: {reason}. Launching that server again in "
+                 f"{PATIENT_RETRY_SECONDS}s, and again until it gets in (try {c.waits}). Press Stop to end it.")
+
+    def _retry_exact(self, c: Client) -> None:
+        with self._launch_lock:
+            if c.cancelled or self._stop_event.is_set() or c.state != "waiting_slot":
+                return
+            try:
+                if self._kill_lineage(c):
+                    for _ in range(20):
+                        if not (self._lineage_pids(c) & set(self.list_pids())):
+                            break
+                        self.sleep(0.5)
+                before = set(self.list_pids())
+                self.launch_fn(c.account, c.place_id, c.strict_job)
+            except Exception as exc:
+                self.log(f"[join] {c.account.username}: retry failed - {exc}")
+                if getattr(exc, "fatal", False):
+                    c.state = "gave_up"
+                    self._emit("rejoin_gaveup", c, f"cannot keep trying: {exc}")
+                else:
+                    c.retry_at = self.clock() + PATIENT_RETRY_SECONDS
+                return
+            c.job_id, c.strict_ok, c.strict_checked, c.misses = c.strict_job, False, 0.0, 0
+            self._await_pid(c, before)
+            if c.state != "running" and not c.cancelled:   # no client appeared: just try again later
+                c.state, c.retry_at = "waiting_slot", self.clock() + PATIENT_RETRY_SECONDS
+            self.sleep(SETTLE_SECONDS)
 
     def _abandon_strict(self, c: Client, reason: str) -> None:
         with self._lock:
@@ -511,29 +669,50 @@ class RejoinManager(threading.Thread):
         self.log(f"[join] {c.account.username}: {reason}; closed it.")
         self._emit("rejoin_gaveup", c, reason)
 
-    def _poll_presence(self, c: Client, uptime: float) -> None:
-        p = self.presence_fn(c.account)
-        if p is None:
-            return  # couldn't tell - never count that as a miss
+    def _poll_presence(self, c: Client, uptime: float, p: dict, regular: bool = True) -> None:
+        """Applies one presence answer. Only a `regular` poll can count as a miss (see LOCATION_*)."""
+        c.in_game = p.get("userPresenceType") == 2
         if p.get("userPresenceType") == 2:
-            c.misses = 0
             place, job = p.get("placeId") or p.get("rootPlaceId"), p.get("gameId")
+            if not regular and not c.reported and c.job_id and job and job != c.job_id and uptime < 90:
+                c.in_game = None     # an early extra check still shows the server it was in BEFORE this join
+                return
+            c.misses = 0
             changed = False
             if place and int(place) != c.place_id:
                 c.place_id, changed = int(place), True
             if job and job != c.job_id:
                 c.job_id, changed = job, True
+            self._report_server(c, p)
             acct = c.account
             if changed or acct.savedPlaceId != c.place_id or acct.savedJobId != c.job_id:
                 acct.savedPlaceId, acct.savedJobId = c.place_id, c.job_id
                 if p.get("lastLocation"):
                     acct.lastGameName = p["lastLocation"]
                 self.store.save()
-        elif uptime >= GRACE_SECONDS:
+        elif regular and uptime >= GRACE_SECONDS:
             c.misses += 1
             if c.misses >= PRESENCE_MISS_LIMIT:
                 ptype = p.get("userPresenceType")
                 self._on_disconnect(c, f"presence says {PRESENCE_NAMES.get(ptype, ptype)}")
+
+    def _report_server(self, c: Client, p: dict) -> None:
+        """Tells on_server_fn which server presence CONFIRMS this client is in (once per server).
+        Private servers are skipped: their server ID cannot be joined from the public flow."""
+        if self.on_server_fn is None or c.private or p.get("userPresenceType") != 2:
+            return
+        place, job = p.get("placeId") or p.get("rootPlaceId"), p.get("gameId")
+        try:
+            place = int(place)
+        except (TypeError, ValueError):
+            return
+        if not job or place <= 0 or c.reported == (place, job):
+            return
+        c.reported = (place, job)
+        try:
+            self.on_server_fn(c.account, place, job, str(p.get("lastLocation") or ""))
+        except Exception as exc:
+            self.log(f"[rejoin] on-server callback failed: {exc!r}")
 
     def _poll_log(self, c: Client, now: float, uptime: float) -> None:
         if c.log_path is None:
@@ -598,7 +777,10 @@ class RejoinManager(threading.Thread):
         if c.cancelled:  # stopped on purpose a moment ago: that is not a disconnect
             return
         if c.strict_job and not c.strict_ok:   # never reached the requested server: do not retry elsewhere
-            self._abandon_strict(c, f"closed before reaching the requested server ({reason})")
+            if c.patient:
+                self._wait_for_slot(c, f"closed before reaching the requested server ({reason})")
+            else:
+                self._abandon_strict(c, f"closed before reaching the requested server ({reason})")
             return
         self.log(f"[rejoin] {c.account.username}: disconnect detected - {reason}")
         self._emit("disconnect", c, reason + ("" if c.account.autoRejoinEnabled else " (auto-rejoin is off)"))
@@ -618,8 +800,8 @@ class RejoinManager(threading.Thread):
                 # "any server" would drop this account into a public server.
                 c.state = "gave_up"
                 self.log(f"[rejoin] {c.account.username}: was in a private server and its code is never saved, "
-                         "so it cannot rejoin it after an app restart. Launch it again from Find server... > "
-                         "Private server.")
+                         "so it cannot rejoin it after an app restart. Launch it again from the Private tab "
+                         "of the join tools.")
                 self._emit("rejoin_gaveup", c, "private server cannot be rejoined after an app restart")
                 return
             now = self.clock()
@@ -687,6 +869,7 @@ class RejoinManager(threading.Thread):
                     c.pid, c.state, c.started = new[0], "running", self.clock()
                     c.log_path, c.log_offset = None, 0
                     c.marker_at, c.misses, c.last_presence = None, 0, self.clock()
+                    c.in_game, c.last_location_poll, c.fetched = None, 0.0, None
                 try:
                     c.created_utc = self.creation_fn(c.pid)
                 except Exception:

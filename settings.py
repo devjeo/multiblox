@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import autorejoin
+import server_finder
 from account_store import DATA_DIR
 
 SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -58,6 +59,14 @@ DEFAULTS = {
     # Scheduler (see scheduler.py)
     "schedulerEnabled": True,
     "scheduleMissedWindowMinutes": 30,   # a run missed while asleep/closed still fires within this long
+    # Server finder cache + hopper (see server_finder.py, server_hopper.py)
+    "serverCacheSeconds": 120,   # a game's server list is reused this long before Roblox is asked again
+    "hopIntervalMinutes": 30,    # default "hop every" in the Server hopper tab
+    "hopMode": "best",           # which server the hopper picks (a server_finder mode)
+    "hopMinPlayers": 0,
+    # Hotkey macros (see macros.py, macro_engine.py)
+    "macrosEnabled": True,       # master switch: off = macro hotkeys do nothing (the stop-all hotkey still works)
+    "macroMaxRunMinutes": 60,    # a macro that is still running after this long stops by itself
 }
 
 
@@ -91,6 +100,7 @@ class Settings(dict):
         autorejoin.ATTEMPT_WINDOW_SECONDS = self["attemptWindowMinutes"] * 60
         autorejoin.PRESENCE_POLL_SECONDS = self["presencePollSeconds"]
         autorejoin.SETTLE_SECONDS = self["launchPauseSeconds"]
+        server_finder.cache.ttl = max(0, self["serverCacheSeconds"])
         if sys.platform != "win32":
             return  # multi_instance needs Windows; nothing to push elsewhere
         import multi_instance

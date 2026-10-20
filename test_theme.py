@@ -38,15 +38,21 @@ class Layout(unittest.TestCase):
         self.assertEqual(sum(theme.split_golden(0)), 0)
 
     def test_window_size_fits_screen_and_grid(self):
-        for sw, sh in ((1366, 768), (1920, 1080), (2560, 1440), (800, 600)):
+        for sw, sh in ((1366, 768), (1920, 1080), (2560, 1440), (800, 600), (640, 480)):
             w, h = theme.window_size(sw, sh)
-            self.assertEqual(w % 8, 0)
-            self.assertEqual(h % 8, 0)
-            self.assertGreaterEqual(w, 880)
-            self.assertGreaterEqual(h, 560)
-            if sw >= 1366:
-                self.assertLessEqual(w, sw)
-                self.assertLessEqual(h, sh)
+            self.assertLessEqual(w, sw)             # never larger than the screen, even a tiny one
+            self.assertLessEqual(h, sh)
+            if sw >= 880 and sh >= 560:
+                self.assertEqual(w % 8, 0)
+                self.assertEqual(h % 8, 0)
+                self.assertGreaterEqual(w, 880)
+                self.assertGreaterEqual(h, 560)
+
+    def test_window_size_is_sixty_percent_of_the_screen(self):
+        for sw, sh in ((1920, 1080), (2560, 1440), (3840, 2160)):
+            w, h = theme.window_size(sw, sh)
+            self.assertAlmostEqual(w / sw, 0.6, delta=0.01)     # only the 16 px grid rounds it down
+            self.assertAlmostEqual(h / sh, 0.6, delta=0.015)
 
     def test_column_widths_sum_exactly(self):
         weights = {"a": 3, "b": 5, "c": 2, "d": 7}

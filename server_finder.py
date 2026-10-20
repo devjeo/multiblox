@@ -19,13 +19,20 @@ Ties are broken by lower ping, then job ID, so the result is deterministic.
 Expect HTTP 429: Roblox rate-limits this list hard. net.request already retries
 with backoff; if it still fails, HttpError is raised and describe_error() turns
 it into a sentence for the dialog.
+
+To stay under that limit, the dialog and the server hopper go through
+find_servers_cached(): one ServerCache per app session keeps each game's list for
+`ttl` seconds, never fetches the same game twice at once, waits out a 429 instead of
+hammering Roblox, and falls back to the last list it has (marked stale) when a
+refresh fails. find_servers() itself is unchanged and never caches.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import net
@@ -59,6 +66,9 @@ class Found:
     servers: list          # de-duplicated, in the order received
     pages: int             # pages read
     partial: bool = False  # a later page failed, so the list may be incomplete
+    cached: bool = False   # served from the session cache, no request was made
+    age: float = 0.0       # seconds since the list was fetched (0 for a fresh one)
+    stale: bool = False    # a refresh failed or is rate-limited, so this is an older list
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +136,103 @@ def find_servers(place_id: int, *, max_pages: int = 5, fetch=net.request) -> Fou
 
 
 # --------------------------------------------------------------------------
+# Session cache (keeps Roblox's 429 away)
+# --------------------------------------------------------------------------
+DEFAULT_TTL = 120.0        # a list younger than this is served without any request
+STALE_TTL = 900.0          # on errors / rate limits an older list is still better than nothing
+RATE_LIMIT_COOLDOWN = 90.0 # after a 429, no new request for this long
+MIN_REFRESH = 10.0         # even a forced refresh waits this long after the last real fetch
+
+
+class ServerCache:
+    """Per-place server lists kept in memory for the life of the app (nothing is written to disk:
+    server IDs are useless after a few minutes). Thread-safe; fetches are serialised so two threads
+    asking for the same game make one request."""
+
+    def __init__(self, ttl: float = DEFAULT_TTL, stale_ttl: float = STALE_TTL,
+                 cooldown: float = RATE_LIMIT_COOLDOWN, min_refresh: float = MIN_REFRESH,
+                 clock=time.monotonic) -> None:
+        self.ttl, self.stale_ttl, self.cooldown, self.min_refresh = ttl, stale_ttl, cooldown, min_refresh
+        self._clock = clock
+        self._entries: dict[int, tuple[float, Found]] = {}
+        self._lock = threading.Lock()          # guards the dicts
+        self._fetch_lock = threading.Lock()    # one real request run at a time
+        self._blocked_until = 0.0
+        self.requests = 0                      # real fetches made (for diagnostics and tests)
+
+    # ---- state ----------------------------------------------------------
+    def cooldown_left(self) -> float:
+        return max(0.0, self._blocked_until - self._clock())
+
+    def invalidate(self, place_id: int | None = None) -> None:
+        with self._lock:
+            if place_id is None:
+                self._entries.clear()
+            else:
+                self._entries.pop(place_id, None)
+
+    def _lookup(self, place_id: int, max_age: float) -> Found | None:
+        with self._lock:
+            entry = self._entries.get(place_id)
+        if entry is None:
+            return None
+        stored, found = entry
+        age = self._clock() - stored
+        if age > max_age:
+            return None
+        return replace(found, cached=True, age=age)
+
+    # ---- main entry -----------------------------------------------------
+    def get(self, place_id: int, *, max_pages: int = 5, force: bool = False, fetch=net.request) -> Found:
+        """The server list for a game. `force` asks for a fresh list but is still held back by
+        `min_refresh` and by a rate-limit cooldown. Raises net.HttpError only when there is
+        nothing at all to show."""
+        if not force:
+            hit = self._lookup(place_id, self.ttl)
+            if hit is not None:
+                return hit
+        with self._fetch_lock:
+            # another thread may have refreshed it while we waited for the lock
+            hit = self._lookup(place_id, self.min_refresh if force else self.ttl)
+            if hit is not None:
+                return hit
+            left = self.cooldown_left()
+            if left > 0:
+                old = self._lookup(place_id, self.stale_ttl)
+                if old is not None:
+                    return replace(old, stale=True)
+                raise net.HttpError(429, reason=f"cooling down for {int(left) + 1}s")
+            try:
+                self.requests += 1
+                found = find_servers(place_id, max_pages=max_pages, fetch=fetch)
+            except net.HttpError as exc:
+                if exc.status == 429:
+                    self._blocked_until = self._clock() + self.cooldown
+                old = self._lookup(place_id, self.stale_ttl)
+                if old is not None:
+                    return replace(old, stale=True)
+                raise
+            stored_at = self._clock()
+            if found.partial:
+                # an incomplete list should not be trusted for the full ttl
+                stored_at -= self.ttl * 0.75
+            with self._lock:
+                self._entries[place_id] = (stored_at, found)
+            return replace(found, cached=False, age=0.0)
+
+
+cache = ServerCache()
+
+
+def find_servers_cached(place_id: int, *, max_pages: int = 5, force: bool = False,
+                        fetch=net.request, use: ServerCache | None = None) -> Found:
+    """find_servers() through the session cache. See ServerCache.get."""
+    if isinstance(place_id, bool) or not isinstance(place_id, int) or place_id <= 0:
+        raise ValueError("place_id must be a positive integer")
+    return (use or cache).get(place_id, max_pages=max_pages, force=force, fetch=fetch)
+
+
+# --------------------------------------------------------------------------
 # Choosing
 # --------------------------------------------------------------------------
 def rank(servers, mode: str, *, min_players: int = 0) -> list[Server]:
@@ -158,7 +265,8 @@ def find_and_choose(place_id: int, mode: str, *, min_players: int = 0, max_pages
 def describe_error(exc: Exception) -> str:
     if isinstance(exc, net.HttpError):
         if exc.status == 429:
-            return "Roblox is rate-limiting server lists right now. Wait a minute and try again."
+            wait = f" ({exc.reason})" if exc.reason.startswith("cooling") else ""
+            return f"Roblox is rate-limiting server lists right now{wait}. Wait a minute and try again."
         if exc.status == 0:
             return f"Could not reach Roblox ({exc.reason or 'network error'})."
         if exc.status in (400, 404):

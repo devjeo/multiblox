@@ -53,14 +53,16 @@ def split_golden(total: int, gap: int = 0) -> tuple[int, int]:
     return usable - side, side
 
 
-def window_size(screen_w: int, screen_h: int, fill: float = 0.62) -> tuple[int, int]:
-    """A window on the golden rectangle, `fill` of the screen's height, kept on the 8 px grid and
-    never larger than 94% of the screen."""
-    h = screen_h * fill
-    w = h * PHI
-    w, h = min(w, screen_w * 0.94), min(h, screen_h * 0.94)
+MIN_WINDOW = (880, 560)   # the main window's layout needs at least this much room
+
+
+def window_size(screen_w: int, screen_h: int, fill_w: float = 0.6, fill_h: float = 0.6) -> tuple[int, int]:
+    """The main window: `fill_w` / `fill_h` (60%) of the screen's width / height, rounded down to the
+    16 px grid. Small screens get MIN_WINDOW, but the window is NEVER larger than the screen."""
     snap = lambda v: int(v // (2 * UNIT)) * (2 * UNIT)
-    return max(snap(w), 880), max(snap(h), 560)
+    w = min(max(snap(screen_w * fill_w), MIN_WINDOW[0]), screen_w)
+    h = min(max(snap(screen_h * fill_h), MIN_WINDOW[1]), screen_h)
+    return w, h
 
 
 def column_widths(total: int, weights: dict) -> dict:

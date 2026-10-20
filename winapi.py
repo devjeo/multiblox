@@ -15,10 +15,21 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import time
 from dataclasses import dataclass
 
 SW_MINIMIZE = 6
 SW_RESTORE = 9
+
+MOUSE_BUTTONS = ("left", "right")   # click() takes one of these
+
+# Keys SendInput must flag as "extended" (the grey arrow/edit block, right Ctrl/Alt, Win keys, ...), or the
+# game sees the numpad version of the key instead.
+EXTENDED_VKS = frozenset({0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,    # PageUp .. Down
+                          0x2C, 0x2D, 0x2E,                                  # PrintScreen, Insert, Delete
+                          0x5B, 0x5C, 0x5D,                                  # left/right Win, Apps
+                          0x6F, 0x90,                                        # numpad divide, NumLock
+                          0xA3, 0xA5})                                       # right Ctrl, right Alt
 
 
 @dataclass(frozen=True)
@@ -59,16 +70,40 @@ class WinApi:
     def is_fullscreen(self, hwnd: int) -> bool:
         return False
 
+    # ---- mouse (hotkey macros, see macros.py / macro_engine.py). Screen pixels, physical.
+    def get_cursor_pos(self) -> tuple[int, int]:
+        raise NotImplementedError
+
+    def move_cursor(self, x: int, y: int) -> bool:
+        raise NotImplementedError
+
+    def click(self, button: str = "left") -> bool:
+        """Presses and releases the mouse button at the current cursor position. False if it failed."""
+        raise NotImplementedError
+
+    # ---- single presses (recorded macros replay these). False if Windows refused the input.
+    def mouse_button(self, button: str, down: bool) -> bool:
+        raise NotImplementedError
+
+    def key(self, vk: int, down: bool) -> bool:
+        """Presses (down=True) or releases a key by virtual-key code."""
+        raise NotImplementedError
+
 
 class FakeWinApi(WinApi):
     """Scripted API for tests. Everything it is asked to do is recorded in `calls`."""
 
-    def __init__(self, monitors=None, windows=None, fullscreen=()):
+    def __init__(self, monitors=None, windows=None, fullscreen=(), cursor=(0, 0)):
         self.monitors = list(monitors) if monitors is not None else [MonitorInfo(0, Rect(0, 0, 1920, 1040))]
         self.windows: dict[int, int] = dict(windows or {})   # pid -> hwnd
         self.fullscreen = set(fullscreen)                     # hwnds
         self.positions: dict[int, Rect] = {}
         self.calls: list[tuple] = []
+        self.cursor: tuple[int, int] = tuple(cursor)         # where the pretend mouse is
+        self.fail_clicks = False                             # tests: make click() / mouse_button() report failure
+        self.fail_keys = False                               # tests: make key() report failure
+        self.keys_down: set[int] = set()                     # keys / buttons pressed and not yet released,
+        self.buttons_down: set[str] = set()                  # so tests can check nothing is left stuck
 
     def enum_windows_for_pids(self, pids):
         return {pid: self.windows[pid] for pid in pids if pid in self.windows}
@@ -92,6 +127,36 @@ class FakeWinApi(WinApi):
     def is_fullscreen(self, hwnd):
         return hwnd in self.fullscreen
 
+    def get_cursor_pos(self):
+        return self.cursor
+
+    def move_cursor(self, x, y):
+        self.calls.append(("move", x, y))
+        self.cursor = (x, y)
+        return True
+
+    def click(self, button="left"):
+        if button not in MOUSE_BUTTONS:
+            raise ValueError(f"unknown mouse button {button!r}")
+        self.calls.append(("click", button, self.cursor))
+        return not self.fail_clicks
+
+    def mouse_button(self, button, down):
+        if button not in MOUSE_BUTTONS:
+            raise ValueError(f"unknown mouse button {button!r}")
+        self.calls.append(("mouse", button, down, self.cursor))
+        if self.fail_clicks:
+            return False
+        (self.buttons_down.add if down else self.buttons_down.discard)(button)
+        return True
+
+    def key(self, vk, down):
+        self.calls.append(("key", vk, down))
+        if self.fail_keys:
+            return False
+        (self.keys_down.add if down else self.keys_down.discard)(vk)
+        return True
+
 
 def real_api() -> WinApi:
     """The Win32 implementation. Raises OSError off Windows."""
@@ -109,6 +174,13 @@ class _RealWinApi(WinApi):
     DWMWA_EXTENDED_FRAME_BOUNDS = 9
     MONITORINFOF_PRIMARY = 1
     MONITOR_DEFAULTTONEAREST = 2
+    INPUT_MOUSE = 0
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    MAPVK_VK_TO_VSC = 0
+    MOUSE_FLAGS = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010)}   # (down, up)
+    CLICK_HOLD_SECONDS = 0.01    # between press and release, so games see a real click
 
     def __init__(self) -> None:
         import ctypes
@@ -149,6 +221,36 @@ class _RealWinApi(WinApi):
         sig(u.GetMonitorInfoW, [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)], wintypes.BOOL)
         sig(u.EnumDisplayMonitors, [wintypes.HDC, ctypes.POINTER(RECT), self.MONITORENUMPROC, wintypes.LPARAM],
             wintypes.BOOL)
+        # mouse input (SendInput). The INPUT union must hold the keyboard and hardware members too,
+        # or sizeof(INPUT) is wrong on 64-bit Windows and SendInput rejects the call.
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        ULONG_PTR = ctypes.c_size_t
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+        class _INPUT_UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+        self.POINT, self.MOUSEINPUT, self.KEYBDINPUT, self.INPUT = POINT, MOUSEINPUT, KEYBDINPUT, INPUT
+        sig(u.GetCursorPos, [ctypes.POINTER(POINT)], wintypes.BOOL)
+        sig(u.SetCursorPos, [ctypes.c_int, ctypes.c_int], wintypes.BOOL)
+        sig(u.SendInput, [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int], wintypes.UINT)
+        sig(u.MapVirtualKeyW, [wintypes.UINT, wintypes.UINT], wintypes.UINT)
         self._set_ctx = None
         try:  # Windows 10 1607+; older systems simply keep the process DPI behaviour
             fn = u.SetThreadDpiAwarenessContext
@@ -294,5 +396,58 @@ class _RealWinApi(WinApi):
                     return False
                 m = info.rcMonitor
                 return (r.left, r.top, r.right, r.bottom) == (m.left, m.top, m.right, m.bottom)
+        except OSError:
+            return False
+
+    # ---- mouse
+    def get_cursor_pos(self):
+        try:
+            with self._dpi():
+                pt = self.POINT()
+                if self.user32.GetCursorPos(self.ct.byref(pt)):
+                    return int(pt.x), int(pt.y)
+        except OSError:
+            pass
+        raise OSError("could not read the cursor position")
+
+    def move_cursor(self, x, y):
+        try:
+            with self._dpi():
+                return bool(self.user32.SetCursorPos(int(x), int(y)))
+        except OSError:
+            return False
+
+    def _send_mouse(self, flags) -> bool:
+        inp = self.INPUT(type=self.INPUT_MOUSE)
+        inp.mi = self.MOUSEINPUT(0, 0, 0, flags, 0, 0)
+        return self.user32.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT)) == 1
+
+    def mouse_button(self, button, down):
+        if button not in self.MOUSE_FLAGS:
+            raise ValueError(f"unknown mouse button {button!r}")
+        try:
+            return self._send_mouse(self.MOUSE_FLAGS[button][0 if down else 1])
+        except OSError:
+            return False
+
+    def key(self, vk, down):
+        try:
+            flags = (0 if down else self.KEYEVENTF_KEYUP) | (self.KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_VKS else 0)
+            scan = self.user32.MapVirtualKeyW(int(vk), self.MAPVK_VK_TO_VSC)
+            inp = self.INPUT(type=self.INPUT_KEYBOARD)
+            inp.ki = self.KEYBDINPUT(int(vk), scan, flags, 0, 0)
+            return self.user32.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT)) == 1
+        except OSError:
+            return False
+
+    def click(self, button="left"):
+        if button not in self.MOUSE_FLAGS:
+            raise ValueError(f"unknown mouse button {button!r}")
+        down, up = self.MOUSE_FLAGS[button]
+        try:
+            if not self._send_mouse(down):
+                return False
+            time.sleep(self.CLICK_HOLD_SECONDS)
+            return self._send_mouse(up)     # always tried after a press, so a button is never left held
         except OSError:
             return False

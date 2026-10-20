@@ -111,9 +111,9 @@ class RuleEditor(tk.Toplevel):
         base = rule or scheduler.Rule()
         self.title("Edit schedule" if rule else "New schedule")
         self.transient(parent)
-        self.resizable(False, False)
+        self.resizable(True, True)
         frm = ttk.Frame(self, padding=14)
-        frm.pack()
+        frm.pack(fill="both", expand=True)
 
         self.action = tk.StringVar(value=base.action)
         self.ttype = tk.StringVar(value=base.targetType)
@@ -165,6 +165,8 @@ class RuleEditor(tk.Toplevel):
         btns.grid(row=r, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btns, text="Save", command=self._save).pack(side="right", padx=6)
+        self.update_idletasks()
+        self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())   # resizable, but never smaller than the form
         self.grab_set()
 
     def _fill_targets(self) -> None:

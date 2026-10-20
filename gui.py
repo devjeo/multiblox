@@ -45,11 +45,15 @@ if sys.platform != "win32":
 
 import autorejoin
 import diagnostics
-import groups
+import hotkeys
+import macro_engine
+import macros
 import multi_instance
 import notify_discord
+import recorder
 import resourcesaver
 import scheduler
+import server_hopper
 import winapi
 import winlayout
 import secrets_store
@@ -71,6 +75,13 @@ from notifier import EVENT_LABELS, Notifier
 from notify_discord import DiscordChannel
 from notify_tray import TrayChannel
 from game_picker import GamePicker
+from join_dialog import JoinTools
+from join_panel import JoinPanel
+from account_history import AccountHistory
+from account_history_dialog import AccountHistoryDialog
+from server_history import ServerHistory
+from current_servers_panel import CurrentServersPanel
+from server_history_panel import ServerHistoryPanel, short_id
 from places import PlaceStore, fetch_place_name, parse_place_input
 from sessions import SessionStore, restore as restore_sessions
 from settings import DEFAULTS, Settings
@@ -84,6 +95,7 @@ STATE_LABELS = {
     "running": ("Running", "ok"),
     "rejoining": ("Rejoining...", "busy"),
     "waiting_retry": ("Retrying soon", "busy"),
+    "waiting_slot": ("Waiting for a slot...", "busy"),
     "gave_up": ("Gave up - use Resume", "bad"),
     "closed": ("Closed", "idle"),
 }
@@ -155,7 +167,13 @@ class App:
         self.places = PlaceStore()
         self.launching: dict[str, str] = {}  # account id -> "Queued..." / "Launching..."
         self.tray = None
-        self._lock_id = None   # account id the list is locked to while Join user is open
+        self.join_panel = None   # the left column (join_panel.py); built in _build_ui
+        self.server_panel = None  # server history card under the accounts (server_history_panel.py)
+        self.current_panel = None  # Current tab: servers your accounts are in right now (current_servers_panel.py)
+        self.server_target: dict | None = None   # a server picked from the history: Launch joins it
+        self.server_history = ServerHistory()
+        self.account_history = AccountHistory()   # per-account list of servers with times
+        self.join_wait = tk.BooleanVar(master=root, value=True)   # Join panel checkbox: keep retrying a full server
         self._closing = False
         self._winapi = None            # built on first use (window layout)
         self._autotiler = None
@@ -183,8 +201,14 @@ class App:
             log_fn=mi_log,
             notify_fn=lambda event, account, detail: self.notifier.notify(event, account, detail),
             on_ready_fn=self._on_client_ready,
+            on_server_fn=self._on_server_seen,
         )
         self.manager.start()
+
+        # Server hopper (see server_hopper.py). Rules are per session; defaults live in settings.
+        self.hopper = server_hopper.ServerHopper(
+            self.manager, log_fn=mi_log, busy_fn=lambda account: account.id in self.launching)
+        self.hopper.start()
 
         # Scheduler (rules in schedules.json). It starts ticking after session restore (see _restore).
         self.rule_store = scheduler.RuleStore()
@@ -197,6 +221,17 @@ class App:
         for problem in self.rule_store.problems:
             mi_log(f"[!] Schedule: {problem}.")
 
+        # Hotkey macros (macros in macros.json). The hotkey listener starts in startup().
+        self.macro_store = macros.MacroStore()
+        self.macro_engine = macro_engine.MacroEngine(
+            self.macro_store.load(), self.macro_store, self.winapi, mi_log,
+            listener=self._make_hotkey_listener(),
+            enabled_fn=lambda: self.settings["macrosEnabled"] and not self._closing,
+            max_run_fn=lambda: self.settings["macroMaxRunMinutes"] * 60,
+            recorder_fn=self._make_recorder)
+        for problem in self.macro_store.problems:
+            mi_log(f"[!] Macros: {problem}.")
+
         # Crash/restart recovery. Records are loaded now, restored after multi-instance is on
         # (see startup). Nothing is written to sessions.json until that has happened.
         self.sessions = SessionStore()
@@ -204,7 +239,7 @@ class App:
             self.sessions.load() if self.settings["restoreSessions"] else ([], True))
         self._restored = False
 
-        # Private server "armed" from Find server... > Private server. Memory only, never saved.
+        # Private server "armed" from the Private tab of the join tools. Memory only, never saved.
         self.launch_extra: dict | None = None
         self.launch_extra_place: int | None = None
         self._arming = False
@@ -304,6 +339,11 @@ class App:
     def set_status(self, text: str) -> None:
         self.ui(lambda: self.status_var.set(text))
 
+    def _queued(self, account_id: str) -> bool:
+        """A patient join whose client is open but not in the requested server yet (it is left alone)."""
+        c = self.manager.clients.get(account_id)
+        return bool(c is not None and c.patient and c.strict_job and not c.strict_ok)
+
     def client_snapshot(self) -> dict:
         with self.manager._lock:
             return {aid: (c.state, c.pid, c.started, len(c.attempts))
@@ -327,25 +367,6 @@ class App:
         if not self.settings["confirmActions"]:
             return True
         return messagebox.askyesno(title, message, icon="warning", default="no", parent=parent or self.root)
-
-    def lock_selection(self, account) -> None:
-        """Keep the account list on exactly this account (Join user works with one account)."""
-        self._lock_id = account.id
-        try:
-            self.tree.selection_set(account.id)
-        except tk.TclError:
-            pass
-
-    def unlock_selection(self) -> None:
-        self._lock_id = None
-
-    def _enforce_lock(self) -> None:
-        lock = getattr(self, "_lock_id", None)
-        if lock and set(self.tree.selection()) != {lock}:
-            try:
-                self.tree.selection_set(lock)
-            except tk.TclError:
-                pass
 
     def selected_accounts(self) -> list:
         chosen = set(self.tree.selection())
@@ -404,14 +425,15 @@ class App:
         root, sp = self.root, theme.space
         root.title(APP_TITLE)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w, h = theme.window_size(sw, sh)
-        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
-        root.minsize(880, 560)
+        w, h = theme.window_size(sw, sh, fill_w=0.86, fill_h=0.9)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 4)}")
+        root.resizable(True, True)    # the user can drag the edges / maximize; nothing in the app ever resizes it
 
         self.pal = ui_style.apply(root, self.settings["theme"])
         _fix_tk_tag_colors(ttk.Style())
         self.icons = IconSet(tk.PhotoImage, 16)
         self._icon_widgets: list = []
+        self._join_scrolls: list = []   # the left panel's scrollable tabs (their canvas colour follows the theme)
         pal = self.pal
 
         # ---- header: logo + title | the two switches | tools
@@ -434,6 +456,7 @@ class App:
         for text, icon, cmd, tip in (
             ("", "sliders", self.open_settings, "Settings"),
             ("", "clock", self.open_schedules, "Schedules"),
+            ("", "refresh", self.open_macros, "Macros: hotkey auto-clickers"),
             ("", "pulse", self.open_diagnostics, "Diagnostics: check that everything works"),
         ):
             self.icon_button(head, text, icon, cmd, "Ghost.TButton", tip).pack(side="right", padx=(sp(1), 0))
@@ -448,28 +471,42 @@ class App:
                       "work. Right-click the app and choose \"Run as administrator\".").pack(anchor="w")
             tk.Frame(root, height=1, background=pal["border"]).pack(fill="x")
 
-        # ---- body: accounts take phi parts, the side panel one part (golden split)
-        main_w, side_w = theme.split_golden(w - 2 * sp(5), gap=sp(4))
-        side_w = max(sp(70), min(side_w, sp(90)))
+        # ---- body: three columns. Join panel | accounts (takes the spare width) | game + actions
+        left_w = max(sp(100), min(int(w * 0.36), sp(140)))   # the join tools (all in one place)
+        side_w = max(sp(62), min(int(w * 0.20), sp(78)))     # Game / Actions on the right
         body = ttk.Frame(root, padding=(sp(5), sp(4), sp(5), 0))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=0, minsize=side_w)
+        # The three columns share the width in fixed proportions (`uniform`), so dragging the window edge
+        # grows or shrinks all of them together and the accounts table is never squeezed out. They only
+        # stop shrinking at the minimum widths below, which are also the window's minimum size.
+        left_min, mid_min, side_min = sp(100), sp(60), sp(62)
+        body.columnconfigure(0, weight=left_w, minsize=left_min, uniform="cols")
+        body.columnconfigure(1, weight=w - left_w - side_w, minsize=mid_min, uniform="cols")
+        body.columnconfigure(2, weight=side_w, minsize=side_min, uniform="cols")
         body.rowconfigure(0, weight=1)
+        min_w = left_min + mid_min + side_min + sp(5) * 2 + sp(4) * 2 + sp(2)
+        root.minsize(min(max(theme.MIN_WINDOW[0], min_w), w), min(theme.MIN_WINDOW[1], h))
 
-        accounts = self.card(body)
-        accounts.outer.grid(row=0, column=0, sticky="nsew", padx=(0, sp(4)))
+        # Left panel: every join tool as a tab of one notebook (Player | Finder | Private | Hopper | History | Current)
+        self.join_card = self.card(body, "Join tools")
+        self.join_card.outer.grid(row=0, column=0, sticky="nsew", padx=(0, sp(4)))
+        self.join_nb = ttk.Notebook(self.join_card, style="Tools.TNotebook")
+        self.join_nb.pack(fill="both", expand=True)
+        wrap = left_w - sp(22)
+        self.join_panel = JoinPanel(self, self.make_join_tab("Player"), wrap=wrap)
+        self.join_tools = JoinTools(self, self.join_nb, wrap)       # adds Finder, Private, Hopper
+        self.server_panel = ServerHistoryPanel(self, self.make_join_tab("History"), self.server_history, wrap)
+        self.current_panel = CurrentServersPanel(self, self.make_join_tab("Current"), wrap)
+
+        mid = ttk.Frame(body)
+        mid.grid(row=0, column=1, sticky="nsew", padx=(0, sp(4)))
+        accounts = self.card(mid)
+        accounts.outer.pack(fill="both", expand=True)
         bar = ttk.Frame(accounts, style="Surface.TFrame")
         bar.pack(fill="x", pady=(0, sp(3)))
         ttk.Label(bar, text="Accounts", style="CardHeading.TLabel").pack(side="left")
         self.count_var = tk.StringVar()
         ttk.Label(bar, textvariable=self.count_var, style="CardMuted.TLabel").pack(side="left", padx=sp(2))
-        self.group_filter = tk.StringVar(value=groups.ALL)
-        self._group_values: tuple = ()
-        self.group_cb = ttk.Combobox(bar, textvariable=self.group_filter, state="readonly", width=16,
-                                     values=[groups.ALL])
-        self.group_cb.pack(side="right")
-        self.group_cb.bind("<<ComboboxSelected>>", lambda e: self._render_rows())
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._render_rows())
         self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=18)
@@ -477,15 +514,14 @@ class App:
         search_icon = ttk.Label(bar, image=self.ico("search"), style="Card.TLabel")
         search_icon.pack(side="right")
         self._icon_widgets.append((search_icon, "search", "text"))
-        ui_style.Tooltip(self.search_entry, "Search by name, group or note (Ctrl+F)", pal)
+        ui_style.Tooltip(self.search_entry, "Search by account name (Ctrl+F)", pal)
 
         tree_box = ttk.Frame(accounts, style="Surface.TFrame")
         tree_box.pack(fill="both", expand=True)
-        cols = ("group", "note", "status", "game", "rejoin", "uptime")
+        cols = ("status", "game", "rejoin", "uptime")
         self.tree = ttk.Treeview(tree_box, columns=cols, selectmode="extended", show="tree headings")
-        heads = {"#0": "Account", "group": "Group", "note": "Note", "status": "Status",
-                 "game": "Last game", "rejoin": "Auto-rejoin", "uptime": "Uptime"}
-        self._col_weights = {"#0": 15, "group": 9, "note": 15, "status": 14, "game": 16, "rejoin": 8, "uptime": 7}
+        heads = {"#0": "Account", "status": "Status", "game": "Server \u00B7 Last game", "rejoin": "Auto-rejoin", "uptime": "Uptime"}
+        self._col_weights = {"#0": 16, "status": 13, "game": 25, "rejoin": 8, "uptime": 8}
         for col, text in heads.items():
             self.tree.heading(col, text=text, anchor="w" if col not in ("rejoin", "uptime") else "center")
             self.tree.column(col, width=sp(24), minwidth=sp(14), stretch=False,
@@ -496,12 +532,12 @@ class App:
         sb.pack(side="left", fill="y")
         self._tree_w = 0
         self.tree.bind("<Configure>", self._fit_columns)
+        ui_style.lock_columns(self.tree)
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Button-3>", self.on_right_click)
         self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
-        self.tree.bind("<Return>", lambda e: self.launch_accounts(self.selected_accounts()))
+        self.tree.bind("<Return>", lambda e: self.launch_selected())
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._enforce_lock(), add="+")
 
         # friendly empty state, shown over the table while there is nothing to list
         self.empty = ttk.Frame(tree_box, style="Surface.TFrame")
@@ -515,21 +551,23 @@ class App:
         self.empty_btn.pack()
 
         self.menu = tk.Menu(root, tearoff=0)
-        self.menu.add_command(label="Launch", command=lambda: self.launch_accounts(self.selected_accounts()))
+        self.menu.add_command(label="Launch", command=self.launch_selected)
+        self.menu.add_command(label="Launch normally (ignore picked player / server)", command=self.launch_normally)
         self.menu.add_command(label="Stop", command=self.stop_selected)
         self.menu.add_command(label="Resume", command=self.resume_selected)
         self.menu.add_command(label="Toggle auto-rejoin", command=self.toggle_selected_rejoin)
         self.menu.add_separator()
-        self.menu.add_command(label="Set group...", command=self.set_group_selected)
-        self.menu.add_command(label="Edit note...", command=self.edit_note_selected)
-        self.menu.add_command(label="Use game box as group default", command=self.set_group_default)
+        self.menu.add_command(label="Server history...", command=self.open_account_history)
+        self.follow_menu = tk.Menu(self.menu, tearoff=0)
+        self.menu.add_cascade(label="Join same server as", menu=self.follow_menu)
         self.menu.add_separator()
         self.menu.add_command(label="Remove account", command=self.remove_selected)
         ui_style.style_menu(self.menu, pal)
+        ui_style.style_menu(self.follow_menu, pal)
 
         # ---- side panel: Game, Actions, Windows, Manage (cards on the same 16 px rhythm)
-        side = ui_style.ScrollFrame(body, pal, width=side_w)
-        side.grid(row=0, column=1, sticky="nsew")
+        side = self.side_scroll = ui_style.ScrollFrame(body, pal, width=side_min)
+        side.grid(row=0, column=2, sticky="nsew")
         right = side.inner
         gap = sp(3)
 
@@ -548,8 +586,6 @@ class App:
         ttk.Label(game, text="Server (job) ID - optional", style="CardMuted.TLabel").pack(anchor="w", pady=(sp(3), sp(1)))
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).pack(fill="x")
-        self.icon_button(game, "Find server...", "search", self.open_join_dialog, "Ghost.TButton",
-                         "Find a quiet server, join a user, or use a private server").pack(anchor="w", pady=(sp(2), 0))
         self.armed_row = ttk.Frame(game, style="Surface.TFrame")  # shown only while a private server is armed
         ttk.Label(self.armed_row, text="Private server armed", style="Warn.TLabel").pack(side="left")
         ttk.Button(self.armed_row, text="Clear", width=6, command=self.clear_private,
@@ -560,11 +596,14 @@ class App:
 
         act = self.card(right, "Actions")
         act.outer.pack(fill="x", pady=(gap, 0))
-        self.icon_button(act, "Launch selected", "play", lambda: self.launch_accounts(self.selected_accounts()),
-                         "Accent.TButton", "Launch the highlighted accounts (Enter)").pack(fill="x")
-        self.group_btn = self.icon_button(act, "Launch group", "users", self.launch_group, tip="Launch every account in the chosen group")
-        self.group_btn.configure(state="disabled")
-        self.group_btn.pack(fill="x", pady=(sp(1.5), 0))
+        self.launch_btn = self.icon_button(act, self.LAUNCH_TEXT, "play", self.launch_selected,
+                                           "Accent.TButton", "Launch the highlighted accounts (Enter). With a "
+                                           "player picked in the Join panel, joins that player's server.")
+        self.launch_btn.pack(fill="x")
+        # shown only while a player or a server is picked (see _refresh_launch_button)
+        self.normal_btn = self.icon_button(act, "Launch normally", "play", self.launch_normally, "Ghost.TButton",
+                                           "Ignore the picked player / server and launch the highlighted "
+                                           "accounts into the Game box.")
         self.icon_button(act, "Join all accounts", "grid", self.join_all).pack(fill="x", pady=(sp(1.5), 0))
         pair = ttk.Frame(act, style="Surface.TFrame")
         pair.pack(fill="x", pady=(sp(1.5), 0))
@@ -653,8 +692,16 @@ class App:
             except tk.TclError:
                 pass
         ui_style.style_menu(self.menu, self.pal)
+        ui_style.style_menu(self.follow_menu, self.pal)
+        for sf in self._join_scrolls:
+            sf.canvas.configure(background=self.pal["surface"])
+        self.side_scroll.canvas.configure(background=self.pal["bg"])
         ui_style.style_text(self.log_text, self.pal)
         self._tag_colors()
+        if self.server_panel is not None:
+            self.server_panel.retag()
+        if self.current_panel is not None:
+            self.current_panel.retag()
         self._draw_logo()
         self._set_theme_glyph()
         self.update_header()
@@ -713,37 +760,34 @@ class App:
         if self._closing:
             return
         self._render_rows()
+        if self.server_panel is not None:
+            self.server_panel.tick()
+        if self.current_panel is not None:
+            self.current_panel.tick()
         if self._restored:
             self.sessions.save(self.manager.session_records(), clean=False)
         self.root.after(1000, self.refresh)
 
-    def _sync_group_filter(self) -> None:
-        """Keeps the Group box in step with the groups that exist."""
-        values = (groups.ALL, *groups.names(self.store.accounts))
-        if values != self._group_values:
-            self._group_values = values
-            self.group_cb.configure(values=list(values))
-        current = self.group_filter.get()
-        if current != groups.ALL and not any(v.lower() == current.lower() for v in values[1:]):
-            self.group_filter.set(groups.ALL)  # the last member left that group
-        self.group_btn.configure(state="disabled" if self.group_filter.get() == groups.ALL else "normal")
-
     def _render_rows(self) -> None:
         """Redraws the account table. No timer here: refresh() schedules itself."""
-        self._sync_group_filter()
-        accounts = groups.filter_accounts(self.store.accounts, self.group_filter.get())
+        accounts = list(self.store.accounts)
         query = self.search_var.get().strip().lower()
         if query:
-            accounts = [a for a in accounts if query in f"{a.username} {a.group} {a.note}".lower()]
+            accounts = [a for a in accounts if query in a.username.lower()]
         existing = set(self.tree.get_children())
         for iid in existing - {a.id for a in accounts}:
             self.tree.delete(iid)
         snap = self.client_snapshot()
         now = self.manager.clock()
+        # username -> short id of the server it is in right now (same text as the History tab's Server ID)
+        where = {name: short_id(job) for (_place, job), v in self.manager.live_servers().items()
+                 for name in v["names"]}
         for idx, a in enumerate(accounts):
             state, pid, started, attempts = snap.get(a.id, (None, None, 0.0, 0))
             if a.id in self.launching:
                 label, tag = self.launching[a.id], "busy"
+            elif state == "running" and self._queued(a.id):
+                label, tag = "Waiting to get in...", "busy"
             elif state:
                 label, tag = STATE_LABELS.get(state, (state, "idle"))
             else:
@@ -752,7 +796,10 @@ class App:
             if state == "running" and started:
                 secs = int(now - started)
                 uptime = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
-            values = (a.group, a.note, "\u25CF  " + label, a.lastGameName or (a.savedPlaceId or ""),
+            game = a.lastGameName or (a.savedPlaceId or "")
+            if a.username in where:
+                game = f"{where[a.username]}  \u00B7  {game}"
+            values = ("\u25CF  " + label, game,
                       "ON" if a.autoRejoinEnabled else "off", uptime)
             tags = (tag, "alt") if idx % 2 else (tag,)
             if a.id in existing:
@@ -774,7 +821,7 @@ class App:
             self.empty_btn.pack()
         else:
             self.empty_title.configure(text="Nothing matches")
-            self.empty_hint.configure(text="Try a different search, or choose All groups.")
+            self.empty_hint.configure(text="Try a different search.")
             self.empty_btn.pack_forget()
         self.empty.place(relx=0.5, rely=0.46, anchor="center")
         self.empty.lift()
@@ -796,6 +843,7 @@ class App:
     # ---- startup / shutdown --------------------------------------------
     def startup(self) -> None:
         mi_log("[ok] Account manager started.")
+        self._start_macros()
         ours = {r.get("pid") for r in self._boot_records if r.get("pid")}
         after = lambda: self.ui(self._restore)  # multi-instance first, THEN recover/adopt sessions
         if self.settings["autoEnableMultiInstance"]:
@@ -826,6 +874,32 @@ class App:
         from schedule_window import ScheduleWindow  # imported on demand (PyInstaller: see the spec file)
         ScheduleWindow(self)
 
+    # ---- hotkey macros ---------------------------------------------------
+    def _make_hotkey_listener(self):
+        try:
+            return hotkeys.real_listener(log_fn=mi_log)
+        except Exception as exc:
+            mi_log(f"[!] Macros: global hotkeys are unavailable: {exc!r}")
+            return None
+
+    def _make_recorder(self):
+        """A new input recorder for one recording (the hooks only exist while recording), or None."""
+        try:
+            return recorder.real_recorder(log_fn=mi_log)
+        except Exception as exc:
+            mi_log(f"[!] Macros: recording is unavailable: {exc!r}")
+            return None
+
+    def _start_macros(self) -> None:
+        try:
+            self.macro_engine.start_hotkeys()
+        except Exception as exc:
+            mi_log(f"[!] Macros: could not start the hotkey listener: {exc!r}")
+
+    def open_macros(self) -> None:
+        from macros_window import MacrosWindow  # imported on demand (PyInstaller: see the spec file)
+        MacrosWindow.show(self)
+
     def on_close(self) -> None:
         if self.tray and self.settings["closeToTray"]:
             self.root.withdraw()
@@ -850,8 +924,10 @@ class App:
         self._closing = True
         if self._restored:
             self.sessions.save(self.manager.session_records(), clean=True)  # a deliberate quit
+        self.hopper.stop()
         self.manager.stop()
         self.scheduler.stop()
+        self.macro_engine.shutdown()
         self.notifier.stop()
         self.watcher.stop()
         self.holder.disable()
@@ -943,7 +1019,9 @@ class App:
 
     # ---- private server (experimental) ----------------------------------
     def arm_private(self, extra: dict, place_id: int) -> None:
-        """Called by the Find server dialog. The next launch from the Game box joins this private server."""
+        """Called by the Private tab. The next launch from the Game box joins this private server."""
+        self.join_panel.clear_target()   # a private server and a picked player exclude each other
+        self.set_server_target(None)
         self._arming = True
         try:
             self.place_var.set(str(place_id))
@@ -962,14 +1040,109 @@ class App:
         mi_log("[ok] Private server cleared; launches go to public servers again.")
 
     def _game_box_edited(self, *_args) -> None:
-        if not self._arming and self.launch_extra is not None:
+        if self._arming:
+            return
+        if self.launch_extra is not None:
             self.clear_private()  # changing the game or server means "not that private server any more"
+        if self.join_panel is not None and self.join_panel.target is not None:
+            self.join_panel.clear_target()   # typing a game or server means "not that player any more"
+        if self.server_target is not None:
+            self.set_server_target(None)
+
+    # ---- join panel -----------------------------------------------------
+    LAUNCH_TEXT = "Launch selected"
+
+    def on_join_target_changed(self, user) -> None:
+        """The Join panel picked (or cleared) a player: the Launch button says what it will do."""
+        if user is not None:
+            if self.launch_extra is not None:
+                self.clear_private()
+            self.set_server_target(None, refresh=False)   # a player and a history server exclude each other
+        self._refresh_launch_button()
+
+    def set_server_target(self, target: dict | None, refresh: bool = True) -> None:
+        """A server picked in the Server history card (or None to drop it)."""
+        if target is not None:
+            if self.launch_extra is not None:
+                self.clear_private()
+            if self.join_panel is not None:
+                self.join_panel.clear_target(notify=False)
+            # History and Current tabs share one pick: the tab that did not get the click lets go
+            for panel in (self.server_panel, self.current_panel):
+                if panel is not None and panel.selected is not None \
+                        and (panel.selected.place_id, panel.selected.job_id) != (target["place_id"], target["job_id"]):
+                    panel.deselect()
+        elif self.server_target is not None:
+            if self.server_panel is not None:
+                self.server_panel.deselect()
+            if self.current_panel is not None:
+                self.current_panel.deselect()
+        self.server_target = target
+        if refresh:
+            self._refresh_launch_button()
+
+    def _refresh_launch_button(self) -> None:
+        user = self.join_panel.target if self.join_panel is not None else None
+        if self.server_target is not None:
+            name = self.server_target.get("game") or f"place {self.server_target['place_id']}"
+            text = f"Join {name}"
+        elif user is not None:
+            text = f"Join {user.display_name or user.name}"
+        else:
+            text = self.LAUNCH_TEXT
+        self.launch_btn.configure(text=text if len(text) <= 26 else text[:25] + "\u2026")
+        normal = getattr(self, "normal_btn", None)   # built after the left panel
+        if normal is not None:
+            if self.server_target is not None or user is not None:
+                normal.pack(fill="x", pady=(theme.space(1.5), 0), after=self.launch_btn)
+            else:
+                normal.pack_forget()
+
+    def _on_server_seen(self, account, place_id: int, job_id: str, game: str) -> None:
+        """RejoinManager callback (manager thread): presence confirmed this account is in this server."""
+        if not game:
+            saved = self.places.find(str(place_id))
+            game = saved.name if saved else (account.lastGameName or "")
+        self.account_history.add(account.userId, place_id, job_id, game)
+        if self.server_history.add(place_id, job_id, game, account.username):
+            self.ui(lambda: self.server_panel.refresh() if self.server_panel is not None else None)
+
+    def launch_selected(self) -> None:
+        """Launch selected / Enter / double-click / right-click Launch. With a player picked in the Join
+        panel it joins that player's server (closing running accounts first), else it launches the
+        Game box as before."""
+        accounts = self.selected_accounts()
+        if self.server_target is not None:
+            t = self.server_target
+            # strict: an account that does not get into that exact server is closed, not sent elsewhere;
+            # move: a running account is closed completely first, then rejoins there
+            self.launch_accounts(accounts, t["place_id"], t["job_id"], strict=True, move=True,
+                                 patient=self.join_wait.get())
+            self.set_server_target(None)   # done: the next Launch selected is a normal launch
+        elif self.join_panel is not None and self.join_panel.target is not None:
+            self.join_panel.join(accounts)
+        else:
+            self.launch_accounts(accounts)
+
+    def launch_normally(self) -> None:
+        """Launch selected into the Game box, ignoring a picked player or history server (which is dropped)."""
+        accounts = self.selected_accounts()
+        if self.join_panel is not None and self.join_panel.target is not None:
+            self.join_panel.clear_target(notify=False)
+        self.set_server_target(None, refresh=False)
+        self._refresh_launch_button()
+        self.launch_accounts(accounts)
 
     def launch_accounts(self, accounts: list, place_id: int | None = None,
-                        job_id: str | None = None, strict: bool = False) -> None:
-        """`place_id` / `job_id` override the Game box (Launch group passes a saved default).
+                        job_id: str | None = None, strict: bool = False, move: bool = False,
+                        patient: bool = False) -> None:
+        """`place_id` / `job_id` override the Game box.
         `strict`: the accounts MUST end up in `job_id`; any that do not get in are closed, not retried
-        (used by Join user)."""
+        (used by the Join panel).
+        `move`: an account that is already running is closed completely and relaunched into `job_id`
+        instead of being skipped (used by the Join panel; the old client never overlaps the new one).
+        `patient` (with `strict`): never time out. The client is left open and waits as long as it takes to
+        get into that server, until Stop (used by player / history joins)."""
         if not accounts:
             messagebox.showinfo("Launch", "Select one or more accounts first.")
             return
@@ -986,41 +1159,61 @@ class App:
             job_id = None
 
         snap = self.client_snapshot()
-        todo = []
+        todo, moving = [], []
         for a in accounts:
-            if a.id in self.launching or snap.get(a.id, ("",))[0] in ("starting", "running", "rejoining"):
-                mi_log(f"[!] {a.username} is already running - skipped (use Stop first).")
+            state = snap.get(a.id, ("",))[0]
+            if a.id in self.launching:
+                mi_log(f"[!] {a.username} is already launching - skipped.")
+            elif state in ("starting", "running", "rejoining", "waiting_slot"):
+                client = self.manager.clients.get(a.id)
+                if move and job_id and client is not None and state == "running" and client.job_id == job_id:
+                    mi_log(f"[ok] {a.username} is already in that server - left as it is.")
+                elif move and job_id:
+                    moving.append(a)
+                else:
+                    mi_log(f"[!] {a.username} is already running - skipped (use Stop first).")
             else:
                 todo.append(a)
-        if not todo:
+        if not todo and not moving:
+            return
+        if moving and not self.confirm(
+                "Close and rejoin?",
+                "These accounts are running. Their game will be closed completely and they will rejoin the "
+                "server you picked:\n\n" + ", ".join(a.username for a in moving[:8])
+                + (" ..." if len(moving) > 8 else "")):
             return
 
         running = len(find_roblox_processes())
-        if not self.holder.active and (running or len(todo) > 1) and not messagebox.askyesno(
+        if todo and not self.holder.active and (running or len(todo) > 1) and not messagebox.askyesno(
                 "Multi-instance is OFF",
                 "A new client will replace the one that is already running (or each other).\n\n"
                 "Launch anyway?"):
             return
-        if running + len(todo) > PERF_WARN_CLIENTS and not messagebox.askokcancel(
+        if todo and running + len(todo) > PERF_WARN_CLIENTS and not messagebox.askokcancel(
                 "Heavy load",
                 f"This would run about {running + len(todo)} Roblox clients at once. "
                 "Each one uses a lot of CPU, RAM and GPU.\n\nContinue?"):
             return
 
-        for a in todo:
+        everyone = todo + moving
+        for a in everyone:
             self.launching[a.id] = "Queued..."
-        self.run_bg(self._launch_worker, todo, place_id, job_id, extra, strict)
+        self.run_bg(self._launch_worker, everyone, place_id, job_id, extra, strict, {a.id for a in moving}, patient)
 
     def _launch_worker(self, accounts: list, place_id: int, job_id: str | None, extra: dict | None = None,
-                       strict: bool = False) -> None:
+                       strict: bool = False, moving: set | None = None, patient: bool = False) -> None:
         total = len(accounts)
         for n, a in enumerate(accounts, 1):
             self.launching[a.id] = "Launching..."
             self.set_status(f"Launching {a.username} ({n}/{total})...")
             try:
-                self.manager.launch(a, place_id, job_id, extra=extra, strict=strict)  # waits for the client + settle pause
+                if moving and a.id in moving:
+                    # closes the running client completely, then launches into the exact server
+                    self.manager.hop(a, place_id, job_id, strict=strict, patient=patient)
+                else:
+                    self.manager.launch(a, place_id, job_id, extra=extra, strict=strict, patient=patient)  # waits for the client + settle pause
                 mi_log(f"[ok] {a.username} is running.")
-            except LaunchError as exc:
+            except (LaunchError, RuntimeError) as exc:   # RuntimeError: the old client would not close
                 mi_log(f"[!] {a.username}: {exc}")
             except Exception as exc:
                 mi_log(f"[!] {a.username}: unexpected error {exc!r}")
@@ -1041,7 +1234,7 @@ class App:
         if not accounts:
             return
         snap = self.client_snapshot()
-        live = [a for a in accounts if snap.get(a.id, ("",))[0] in ("starting", "running", "rejoining", "waiting_retry")]
+        live = [a for a in accounts if snap.get(a.id, ("",))[0] in ("starting", "running", "rejoining", "waiting_retry", "waiting_slot")]
         if live and not self.confirm(
                 "Stop clients?", f"Close the Roblox client for {len(live)} account(s)?\n\n"
                 + ", ".join(a.username for a in live[:8]) + (" ..." if len(live) > 8 else "")
@@ -1083,99 +1276,16 @@ class App:
                 mi_log(f"[!] {a.username}: nothing to resume.")
 
     # ---- groups and notes -----------------------------------------------
-    def launch_group(self) -> None:
-        group = self.group_filter.get()
-        members = groups.filter_accounts(self.store.accounts, group)
-        if group == groups.ALL or not members:
-            messagebox.showinfo("Launch group", "Pick a group in the Group box above the account list first.")
-            return
-        if self.place_var.get().strip():  # a game picked or typed in the Game box wins
-            self.launch_accounts(members)
-            return
-        target = groups.resolve_target(group, None, None, self.settings["groupGames"], members)
-        if target is None:
-            messagebox.showinfo(
-                "Launch group",
-                "No game is set for this group. Pick a game in the Game box, or right-click an account "
-                "in the group and choose 'Use game box as group default'.")
-            return
-        place_id, job_id = target
-        self.launch_accounts(members, place_id=place_id, job_id=job_id)
-
-    def set_group_selected(self) -> None:
-        accounts = self.selected_accounts()
-        if not accounts:
-            return
-        current = accounts[0].group if len({a.group for a in accounts}) == 1 else ""
-        value = simpledialog.askstring(
-            "Set group", "Group name (leave empty to clear):", initialvalue=current, parent=self.root)
-        if value is None:
-            return
-        try:
-            for a in accounts:
-                self.store.set_group(a, value)
-        except ValueError as exc:
-            messagebox.showwarning("Set group", str(exc), parent=self.root)
-            return
-        names = ", ".join(a.username for a in accounts)
-        mi_log(f"[ok] Group {accounts[0].group!r} set for: {names}" if accounts[0].group
-               else f"[ok] Group cleared for: {names}")
-        self._render_rows()
-
-    def edit_note_selected(self) -> None:
-        accounts = self.selected_accounts()
-        if not accounts:
-            return
-        current = accounts[0].note if len({a.note for a in accounts}) == 1 else ""
-        value = simpledialog.askstring(
-            "Edit note", "Note (leave empty to clear):", initialvalue=current, parent=self.root)
-        if value is None:
-            return
-        for a in accounts:
-            self.store.set_note(a, value)
-        self._render_rows()
-
-    def set_group_default(self) -> None:
-        """Saves the game in the Game box as the default for the selected account's group."""
-        accounts = self.selected_accounts()
-        group = accounts[0].group if accounts else ""
-        if not group:
-            messagebox.showinfo("Group default", "Right-click an account that is in a group "
-                                                 "(use 'Set group...' first).")
-            return
-        raw = self.place_var.get().strip()
-        if not raw:
-            messagebox.showinfo("Group default", "Pick a game in the Game box first.")
-            return
-        saved = self.places.find(raw)
-        place_id = saved.placeId if saved else parse_place_input(raw)[0]
-        if place_id is None:
-            messagebox.showwarning("Group default", "That is not a saved game, a place ID, or a roblox.com game link.")
-            return
-        job_id = self.job_var.get().strip() or None
-        if job_id and len(job_id) < 8:
-            job_id = None
-        games = {k: v for k, v in self.settings["groupGames"].items() if k.strip().lower() != group.lower()}
-        games[group] = {"placeId": place_id, "jobId": job_id}
-        self.settings["groupGames"] = games
-        try:
-            self.settings.save()
-        except OSError as exc:
-            messagebox.showwarning("Group default", f"Applied, but could not save: {exc}")
-        mi_log(f"[ok] Group {group!r} will launch place {place_id} when no game is picked.")
-
     # ---- join tools -----------------------------------------------------
-    def open_join_dialog(self) -> None:
-        """Server finder window. Imported here, on demand, so the main window stays light."""
-        from join_dialog import JoinDialog
-        dlg = getattr(self, "_join_dlg", None)
-        try:
-            if dlg is not None and dlg.winfo_exists():
-                dlg.lift()
-                return
-        except tk.TclError:
-            pass
-        self._join_dlg = JoinDialog(self)
+    def make_join_tab(self, text: str) -> ttk.Frame:
+        """Adds a scrollable tab to the left panel's notebook and returns the frame to build into. It
+        scrolls only when the window is too short for its content."""
+        sf = ui_style.ScrollFrame(self.join_nb, self.pal, padding=theme.space(3))
+        sf.canvas.configure(background=self.pal["surface"])
+        sf.inner.configure(style="Surface.TFrame")
+        self.join_nb.add(sf, text=text)
+        self._join_scrolls.append(sf)
+        return sf.inner
 
     # ---- auto-rejoin ----------------------------------------------------
     def toggle_selected_rejoin(self) -> None:
@@ -1282,14 +1392,65 @@ class App:
         iid = self.tree.identify_row(event.y)
         if iid:
             self.tree.selection_set(iid)
-            self.launch_accounts(self.selected_accounts())
+            self.launch_selected()
 
     def on_right_click(self, event) -> None:
         iid = self.tree.identify_row(event.y)
         if iid and iid not in self.tree.selection():
             self.tree.selection_set(iid)
         if self.tree.selection():
+            self._fill_follow_menu()
             self.menu.tk_popup(event.x_root, event.y_root)
+
+    # ---- per-account server history / follow another account ---------------
+    def open_account_history(self) -> None:
+        accounts = self.selected_accounts()
+        if len(accounts) != 1:
+            messagebox.showinfo("Server history", "Select exactly one account to see its server history.")
+            return
+        AccountHistoryDialog(self, accounts[0])
+
+    def current_server_of(self, account) -> tuple[int, str, str] | None:
+        """(place_id, job_id, game) of the public server this account is in RIGHT NOW (its client is
+        running and Roblox confirmed the server), else None. Your own presence is always visible to
+        you, so this works even when the account's privacy hides it from others."""
+        snap = self.client_snapshot().get(account.id)
+        if not snap or snap[0] != "running":
+            return None
+        with self.manager._lock:
+            c = self.manager.clients.get(account.id)
+            if c is None or c.private or not c.reported:
+                return None   # only a server Roblox presence CONFIRMED, never one that was just requested
+            return int(c.reported[0]), str(c.reported[1]), account.lastGameName or ""
+
+    def _fill_follow_menu(self) -> None:
+        """Right-click > Join same server as > <account>: the selected accounts go to where that account is."""
+        self.follow_menu.delete(0, "end")
+        chosen = {a.id for a in self.selected_accounts()}
+        shown = 0
+        for leader in self.store.accounts:
+            if leader.id in chosen and len(chosen) == 1:
+                continue   # nothing to follow: that is the only account selected
+            where = self.current_server_of(leader)
+            if where is None:
+                continue
+            shown += 1
+            label = f"{leader.username}  ({where[2] or 'place ' + str(where[0])})"
+            self.follow_menu.add_command(label=label, command=lambda l=leader: self.join_same_server_as(l))
+        if not shown:
+            self.follow_menu.add_command(label="(no account is in a server right now)", state="disabled")
+
+    def join_same_server_as(self, leader) -> None:
+        where = self.current_server_of(leader)
+        if where is None:
+            messagebox.showinfo("Join same server", f"{leader.username} is not in a server right now.")
+            return
+        followers = [a for a in self.selected_accounts() if a.id != leader.id]
+        if not followers:
+            messagebox.showinfo("Join same server", "Select the other account(s) to send there first.")
+            return
+        place_id, job_id, _game = where
+        self.launch_accounts(followers, place_id, job_id, strict=True, move=True, patient=self.join_wait.get())
 
     # ---- diagnostics ----------------------------------------------------
     def open_diagnostics(self) -> None:
@@ -1353,7 +1514,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Settings")
         win.transient(self.root)
-        win.resizable(False, True)
+        win.resizable(True, True)
         sp = theme.space
         # Fixed footer (Save/Cancel always visible) under a tabbed body: the dialog stays short.
         footer = ttk.Frame(win, padding=(sp(4), sp(3)))

@@ -127,9 +127,28 @@ def apply(root: tk.Misc, mode: str = "dark") -> dict:
                 bordercolor=pal["border"], lightcolor=pal["bg"], darkcolor=pal["bg"])
     s.map("TNotebook.Tab", background=[("selected", pal["bg"])], foreground=[("selected", pal["text"])],
           lightcolor=[("selected", pal["bg"])])
+    # the left panel's tool tabs: same colour as the card they sit in, tighter tabs so five fit
+    s.configure("Tools.TNotebook", background=pal["surface"], bordercolor=pal["border"], tabmargins=(0, sp(1), 0, 0))
+    s.configure("Tools.TNotebook.Tab", background=pal["surface"], foreground=pal["muted"], padding=(sp(2.5), sp(1.5)),
+                bordercolor=pal["border"], lightcolor=pal["surface"], darkcolor=pal["surface"])
+    s.map("Tools.TNotebook.Tab", background=[("selected", pal["surface"])],
+          foreground=[("selected", pal["text"])], lightcolor=[("selected", pal["surface"])])
     s.configure("Horizontal.TProgressbar", background=pal["accent"], troughcolor=pal["raised"],
                 bordercolor=pal["raised"], lightcolor=pal["accent"], darkcolor=pal["accent"])
     return pal
+
+
+def autowrap(label: ttk.Label, container=None, margin: int = 0, minimum: int = 120) -> ttk.Label:
+    """Keeps a wrapping label as wide as its container (minus `margin`), so its text re-wraps when the
+    window is resized instead of being cut off. Returns the label."""
+    box = container or label.master
+    box.bind("<Configure>", lambda e: label.configure(wraplength=max(minimum, e.width - margin)), add="+")
+    return label
+
+
+def lock_columns(tree: ttk.Treeview) -> None:
+    """Column widths are fixed: dragging a heading border does nothing."""
+    tree.bind("<Button-1>", lambda e: "break" if tree.identify_region(e.x, e.y) == "separator" else None, add="+")
 
 
 def style_menu(menu: tk.Menu, pal: dict) -> None:

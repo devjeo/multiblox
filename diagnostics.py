@@ -473,6 +473,13 @@ def check_join_tools(include_network: bool = True):
     else:
         results.append(_info("Server finder", f"last run ({last['at']}, place {last['placeId']}, mode {last['mode']}): "
                                               f"{last['count']} servers, picked {last['jobId'] or 'none'}"))
+    cache = server_finder.cache
+    left = cache.cooldown_left()
+    if left > 0:
+        results.append(_warn("Server cache", f"Roblox rate-limited the server list; no new requests for {int(left)}s"))
+    elif cache.requests:   # shown only after a real request, so an unused session adds no line
+        results.append(_info("Server cache", f"{cache.requests} list request(s) this session, "
+                                             f"lists kept {int(cache.ttl)}s"))
     friend = dict(friends.last_result)  # shown only after a lookup, so an unused session adds no line
     if friend.get("error"):
         results.append(_warn("Friend join", f"last lookup ({friend['at']}): {friend['error']}"))
